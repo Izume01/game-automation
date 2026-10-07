@@ -1571,18 +1571,34 @@ _Q_COMPACT = re.compile(r"^\s*(\d+)([+\-*/xX])(\d+)\s*$")
 def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
     """Pull (a, b) out of one OCR pass.
 
-    Two ways, in order. The spaced form is the honest reading; the compact form
-    is a repair for the classic miss where tesseract splits a two-digit number
-    ("5 + 66" -> "5 + 6 6"), which otherwise yields three tokens and a
-    confidently wrong sum.
+    Handles clean forms, compact forms, stripped punctuation, and noisy
+    tokens (e.g. '+' recognized as '4+' or '1+').
     """
-    flat = " ".join((text or "").split())
+    if not text:
+        return None
+    flat = " ".join(text.split()).strip(". ,:;")
+
     m = _Q_FULL.match(flat)
     if m:
         return int(m.group(1)), int(m.group(3))
-    m = _Q_COMPACT.match(flat.replace(" ", ""))
+
+    m = _Q_COMPACT.match(flat.replace(" ", "").strip(". ,:;"))
     if m:
         return int(m.group(1)), int(m.group(3))
+
+    parts = flat.split()
+    if len(parts) >= 2 and parts[0].isdigit() and parts[-1].isdigit():
+        return int(parts[0]), int(parts[-1])
+
+    m = re.search(r"(\d+)\s*([+\-*/xX])\s*(\d+)", flat)
+    if m:
+        return int(m.group(1)), int(m.group(3))
+
+    nums = [int(n) for n in re.findall(r"\d+", flat)]
+    if len(nums) == 2:
+        return nums[0], nums[1]
+    if len(nums) == 3 and nums[1] in (1, 4):
+        return nums[0], nums[2]
     return None
 
 
@@ -1671,6 +1687,10 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
         if pair is not None:
             votes[pair] = votes.get(pair, 0) + 1
     if not votes:
+        fallback_txt = _ocr_png(path)
+        pair = _parse_reading(fallback_txt)
+        if pair is not None:
+            return pair[0], pair[1], fallback_txt
         return None
     (a, b), _n = max(votes.items(), key=lambda kv: kv[1])
     return a, b, raw[0]
@@ -1725,6 +1745,7 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
     kasa: Optional[str] = None
     reason = ""
     gates = 0
+    consecutive_unreadable = 0
     workdir = tempfile.mkdtemp(prefix="ticarisk_math_")
     qpath = os.path.join(workdir, "q.png")
     try:
@@ -1758,8 +1779,17 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
 
             read = _read_question(qpath)
             if read is None:
-                reason = f"could not read question: {_ocr_png(qpath)!r}"
-                break
+                consecutive_unreadable += 1
+                log.warning(
+                    "math: unreadable question image (attempt %d/3): %r",
+                    consecutive_unreadable, _ocr_png(qpath)
+                )
+                if consecutive_unreadable >= 3:
+                    reason = f"could not read question: {_ocr_png(qpath)!r}"
+                    break
+                time.sleep(1.0)
+                continue
+            consecutive_unreadable = 0
             a0, b0, text = read
             nums = [a0, b0]
             tipi = str(q.get("islem_tipi") or "")
