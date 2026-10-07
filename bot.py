@@ -1384,18 +1384,20 @@ def ncc_candidates(bg, piece, pw, ph, py, topk=5, gap=6):
         if any(abs(x - q) < gap for q in picked):
             continue
         picked.append(x)
-        out.append(max(0.0, min(x / w * 100.0, max_pct)))
+        pct = max(0.0, min(x / w * 100.0, max_pct))
+        conf = float(scores[x])
+        out.append((pct, conf))
         if len(out) >= topk:
             break
     return out
 
 
-def build_candidates(score_pcts, ncc_pcts, edge_pcts):
+def build_candidates(score_pcts, ncc_hits, edge_pcts):
     """Merge detectors the way the userscript does: NCC leads only when its peak
     is clearly dominant, otherwise the 4-side scorer goes first."""
     out, seen = [], set()
 
-    def add(pct, ):
+    def add(pct):
         if pct is None or pct != pct:
             return
         k = round(float(pct), 2)
@@ -1404,18 +1406,19 @@ def build_candidates(score_pcts, ncc_pcts, edge_pcts):
         seen.add(k)
         out.append(k)
 
-    n0 = ncc_pcts[0] if ncc_pcts else None
-    n1 = ncc_pcts[1] if len(ncc_pcts) > 1 else None
-    dominant = n0 is not None and n0 >= 0.55 and (n1 is None or (n0 - n1) >= 0.12)
+    n0 = ncc_hits[0] if ncc_hits else None
+    n1 = ncc_hits[1] if len(ncc_hits) > 1 else None
+    # n0[1] is the NCC correlation confidence (-1.0 to 1.0)
+    dominant = n0 is not None and n0[1] >= 0.55 and (n1 is None or (n0[1] - n1[1]) >= 0.12)
     if dominant:
-        add(n0)
+        add(n0[0])
         add(score_pcts[0] if score_pcts else None)
     else:
         add(score_pcts[0] if score_pcts else None)
-        add(n0)
+        add(n0[0] if n0 else None)
     for p in score_pcts[1:]:
         add(p)
-    for p in ncc_pcts[1:]:
+    for p, _conf in ncc_hits[1:]:
         add(p)
     for p in edge_pcts:
         add(p)
@@ -1425,9 +1428,9 @@ def build_candidates(score_pcts, ncc_pcts, edge_pcts):
 def detect_slot(bg, piece, pw, ph, py):
     """Ordered percent guesses for the slider, best first."""
     score_pcts = [pct_of(L, bg.shape[1], pw) for L, _s, _t in score_positions(bg, pw, ph, py)]
-    ncc_pcts = ncc_candidates(bg, piece, pw, ph, py)
+    ncc_hits = ncc_candidates(bg, piece, pw, ph, py)
     edge_pcts = edge_candidates(bg, pw, ph, py)
-    return build_candidates(score_pcts, ncc_pcts, edge_pcts)
+    return build_candidates(score_pcts, ncc_hits, edge_pcts)
 
 
 def _unlock_seconds(v: dict) -> int:
