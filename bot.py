@@ -1564,6 +1564,118 @@ def _ocr_png(path: str) -> str:
                 pass
 
 
+_Q_FULL = re.compile(r"^\s*(\d+)\s*([+\-*/xX])\s*(\d+)\s*$")
+_Q_COMPACT = re.compile(r"^\s*(\d+)([+\-*/xX])(\d+)\s*$")
+
+
+def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
+    """Pull (a, b) out of one OCR pass.
+
+    Two ways, in order. The spaced form is the honest reading; the compact form
+    is a repair for the classic miss where tesseract splits a two-digit number
+    ("5 + 66" -> "5 + 6 6"), which otherwise yields three tokens and a
+    confidently wrong sum.
+    """
+    flat = " ".join((text or "").split())
+    m = _Q_FULL.match(flat)
+    if m:
+        return int(m.group(1)), int(m.group(3))
+    m = _Q_COMPACT.match(flat.replace(" ", ""))
+    if m:
+        return int(m.group(1)), int(m.group(3))
+    return None
+
+
+def _clean_image(path: str) -> Optional[str]:
+    """Replicate the userscript's cleanImage(), byte for byte in behaviour.
+
+      1. upscale 2x
+      2. binarize: mean RGB > 95 -> foreground
+      3. despeckle: drop a foreground pixel with fewer than 2 of 8 neighbours
+
+    Without this the text arrives anti-aliased over a gradient and tesseract
+    occasionally splits a two-digit number ("5 + 66" -> "5 + 6 6"), which the
+    parser then reads as a real three-token expression. Written as PGM because
+    tesseract takes it directly and it needs no encoder.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        arr, _w, _h = _im_load(data)
+    except Exception:  # noqa: BLE001
+        return None
+
+    fg = arr.mean(2) > 95
+    n = np.zeros(fg.shape, dtype=np.int16)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            n += np.roll(np.roll(fg, dy, 0), dx, 1)
+    keep = fg.copy()
+    keep[1:-1, 1:-1] = fg[1:-1, 1:-1] & (n[1:-1, 1:-1] >= 2)
+
+    out = np.where(keep, 0, 255).astype(np.uint8)
+    out = np.repeat(np.repeat(out, 2, 0), 2, 1)  # scale = 2
+    dest = path + ".clean.pgm"
+    try:
+        with open(dest, "wb") as fh:
+            fh.write(f"P5\n{out.shape[1]} {out.shape[0]}\n255\n".encode())
+            fh.write(out.tobytes())
+    except OSError:
+        return None
+    return dest
+
+
+def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
+    """OCR a question image, trusting only a reading the passes agree on.
+
+    Returns (a, b, text). None when no pass produced a clean two-number
+    reading — the caller stops rather than answering from a guess.
+    """
+    wl = "0123456789+-*=xX. "
+    raw: List[str] = []
+
+    def run(args: List[str]) -> None:
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return
+        t = " ".join((r.stdout or "").split())
+        if t:
+            raw.append(t)
+
+    clean = _clean_image(path)
+    src = clean or path
+    base = ["tesseract", src, "stdout", "-l", "eng",
+            "-c", f"tessedit_char_whitelist={wl}"]
+    # cleaned image first — that is what the proven script feeds its OCR
+    for psm in ("7", "8", "6"):
+        run(base + ["--psm", psm])
+    # raw image as a tie-breaker: when both agree the reading is certain
+    if clean:
+        for psm in ("7", "8"):
+            run(["tesseract", path, "stdout", "-l", "eng", "--psm", psm,
+                 "-c", f"tessedit_char_whitelist={wl}"])
+
+    for junk in (clean, clean and clean.replace(".clean.pgm", ".clean.pgm")):
+        if junk and os.path.exists(junk):
+            try:
+                os.remove(junk)
+            except OSError:
+                pass
+
+    votes: Dict[Tuple[int, int], int] = {}
+    for t in raw:
+        pair = _parse_reading(t)
+        if pair is not None:
+            votes[pair] = votes.get(pair, 0) + 1
+    if not votes:
+        return None
+    (a, b), _n = max(votes.items(), key=lambda kv: kv[1])
+    return a, b, raw[0]
+
+
 def _pick_math_op(text: str, tipi: str) -> str:
     """The server's islem_tipi wins; OCR symbols are only a fallback."""
     if tipi in MATH_OPS:
@@ -1644,13 +1756,18 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
             if inspect and n <= 3:
                 dump(f"inspect/math_q{n}.png", img.content)
 
-            text = _ocr_png(qpath)
-            nums = [int(x) for x in re.findall(r"\d+", text)]
-            if len(nums) < 2:
-                reason = f"could not read question: {text!r}"
+            read = _read_question(qpath)
+            if read is None:
+                reason = f"could not read question: {_ocr_png(qpath)!r}"
                 break
-            op = _pick_math_op(text, str(q.get("islem_tipi") or ""))
-            ans = _apply_op(nums[0], nums[1], op)
+            a0, b0, text = read
+            nums = [a0, b0]
+            tipi = str(q.get("islem_tipi") or "")
+            op = _pick_math_op(text, tipi)
+            if n == 1:
+                log.info("math: server islem_tipi=%r -> op %r (MATH_OPS=%s)",
+                         tipi, op, json.dumps(MATH_OPS, ensure_ascii=False))
+            ans = _apply_op(a0, b0, op)
             if ans is None:
                 reason = f"unhandled operator in {text!r}"
                 break
@@ -1694,6 +1811,19 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
                 right += 1
             else:
                 wrong += 1
+                # keep everything needed to diagnose the miss: the image the
+                # server sent, what OCR made of it, and the verdict itself.
+                # The verdict distinguishes a bad read from a bad submission
+                # (too fast, stale token, wrong operator).
+                dump(f"inspect/math_miss_{wrong}.png", img.content)
+                log.warning(
+                    "math MISS #%d | islem_tipi=%r ocr=%r nums=%s op=%r "
+                    "ans=%s -> %s",
+                    wrong,
+                    str(q.get("islem_tipi") or ""),
+                    text, nums, op, ans,
+                    json.dumps(a, ensure_ascii=False)[:400],
+                )
             if a.get("kalan_islem") is not None:
                 try:
                     kalan = int(a["kalan_islem"])
