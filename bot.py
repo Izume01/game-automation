@@ -1563,27 +1563,29 @@ def _ocr_png(path: str) -> str:
                 pass
 
 
-_Q_FULL = re.compile(r"^\s*(\d+)\s*([+\-*/xX])\s*(\d+)\s*$")
-_Q_COMPACT = re.compile(r"^\s*(\d+)([+\-*/xX])(\d+)\s*$")
+_Q_FULL = re.compile(r"^\s*(-?\d+)\s*([+\-*/xX])\s*(-?\d+)\s*$")
+_Q_COMPACT = re.compile(r"^\s*(-?\d+)([+\-*/xX])(-?\d+)\s*$")
 
 
 def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
     """Pull (a, b) out of one OCR pass.
 
-    Handles clean forms, compact forms, stripped punctuation, and noisy
-    tokens (e.g. '+' recognized as '4+' or '1+').
+    Handles clean forms, compact forms, signed/negative operands (e.g. -1 + 99),
+    and noisy tokens (e.g. '+' recognized as '4+' or '1+').
     """
     if not text:
         return None
     flat = " ".join(text.split()).strip(". ,:;")
 
     def fix_2digit(n: int) -> int:
-        if n > 99:
-            s = str(n)
+        sign = -1 if n < 0 else 1
+        val = abs(n)
+        if val > 99:
+            s = str(val)
             if len(s) == 3 and s[0] == '4':
-                return int(s[1:])
+                return sign * int(s[1:])
             if len(s) == 3 and s[-1] == '4':
-                return int(s[:-1])
+                return sign * int(s[:-1])
         return n
 
     m = _Q_FULL.match(flat)
@@ -1595,14 +1597,14 @@ def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
         return fix_2digit(int(m.group(1))), fix_2digit(int(m.group(3)))
 
     parts = flat.split()
-    if len(parts) >= 2 and parts[0].isdigit() and parts[-1].isdigit():
+    if len(parts) >= 2 and parts[0].lstrip("-").isdigit() and parts[-1].lstrip("-").isdigit():
         return fix_2digit(int(parts[0])), fix_2digit(int(parts[-1]))
 
-    m = re.search(r"(\d+)\s*([+\-*/xX])\s*(\d+)", flat)
+    m = re.search(r"(-?\d+)\s*([+\-*/xX])\s*(-?\d+)", flat)
     if m:
         return fix_2digit(int(m.group(1))), fix_2digit(int(m.group(3)))
 
-    nums = [int(n) for n in re.findall(r"\d+", flat)]
+    nums = [int(n) for n in re.findall(r"-?\d+", flat)]
     if len(nums) == 2:
         return fix_2digit(nums[0]), fix_2digit(nums[1])
     if len(nums) == 3 and nums[1] in (1, 4):
