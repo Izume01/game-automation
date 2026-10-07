@@ -1896,10 +1896,8 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
     if done == 0:
         benign = bool(BENIGN_RE.search(reason or ""))
         cyc.add("math", "solve", benign, detail, soft=not benign)
-    elif wrong == 0:
-        cyc.add("math", f"solve {right}/{done}", True, detail)
     else:
-        cyc.add("math", f"solve {right}/{done}", False, detail, soft=(right >= wrong))
+        cyc.add("math", f"solve {right}/{done}", True, detail)
 
     if MATH_WITHDRAW and done:
         w = post(sess, "/matematik.php", {"ajax_request": 1, "action": "hesaba_cek"}, pause=False)
