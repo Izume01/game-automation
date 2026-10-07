@@ -1,0 +1,9 @@
+inspect/
+ticarisk-cycle.log
+__pycache__/
+*.pyc
+cookies*.json
+restock_spend.json
+
+# rotation cursor (local state, not source)
+crop_rotation.json

@@ -1,0 +1,1647 @@
+#!/usr/bin/env python3
+"""Ticarisk production + farm automation.
+
+Designed to run headless on a schedule (GitHub Actions / cron). One cycle:
+
+  Production (businesses.php)
+    1. collect output from every business      action=toplu_tum_isletme_topla
+    2. restart any idle production slot        start_production
+
+  Farm
+    tarlalar.php  harvest ready fields, then replant empty fields
+    bahceler.php  harvest ripe fruit, then water orchards waiting for water
+    ahirlar.php   collect barn products (and feed, if enabled)
+    kumesler.php  collect coop products (and feed, if enabled)
+    aricilik.php  harvest honeycomb
+
+Every mutating call is idempotent server-side: the game re-validates state and
+returns a plain business error ("not ready", "not waiting for watering", ...)
+rather than double-applying. That makes re-running a cycle safe.
+
+Credentials come from TICARISK_USER / TICARISK_PASS.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urljoin
+
+try:  # the slider solver needs numpy; everything else degrades gracefully
+    import numpy as np
+except Exception:  # pragma: no cover - numpy ships with the requirements
+    np = None  # type: ignore[assignment]
+
+import requests
+import urllib3
+
+urllib3.disable_warnings()
+
+# --------------------------------------------------------------------------- config
+
+BASE = os.environ.get("TICARISK_BASE", "https://www.ticarisk.com").rstrip("/")
+USER = os.environ.get("TICARISK_USER", "")
+PASSWORD = os.environ.get("TICARISK_PASS", "")
+
+DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math"
+
+# Math game (matematik.php). Each question is a PNG, so this section shells out
+# to the tesseract binary; without it, the section reports itself skipped.
+MATH_ON = os.environ.get("TICARISK_MATH", "1") == "1"
+MATH_MAX = int(os.environ.get("TICARISK_MATH_MAX", "400"))   # safety stop
+MATH_WITHDRAW = os.environ.get("TICARISK_MATH_WITHDRAW", "1") == "1"
+# Hard floor: the server rejects an answer arriving under ~1.4 s. OCR and both
+# round trips are fitted INSIDE this window, so a question costs ~1.6 s total —
+# the pause between requests (TICARISK_PAUSE) is deliberately not added on top.
+MATH_MIN_MS = int(os.environ.get("TICARISK_MATH_MIN_MS", "1500"))
+MATH_OPS = {"toplama": "+", "cikarma": "-", "carpma": "*", "bolme": "/"}
+# Slider captcha. 5 rejected verify_human calls lock the account for 600 s, so
+# the budget is 4 — and it is spent ONE position per puzzle: burn a guess, drop
+# that challenge and generate a fresh one, exactly as the userscript does. That
+# is why the script never locks: it never fires a second guess at the same
+# puzzle. The 4-guess ceiling is per gate and resets when a new gate appears.
+CAPTCHA_GUESSES = int(os.environ.get("TICARISK_CAPTCHA_GUESSES", "4"))
+CAPTCHA_ROUNDS = int(os.environ.get("TICARISK_CAPTCHA_ROUNDS", "4"))
+CAPTCHA_MAX_GATES = int(os.environ.get("TICARISK_CAPTCHA_MAX_GATES", "60"))
+
+# 4 = Potato (6 h), 1 = Wheat (4 h). Fallback seed and the crop used when
+# rotation is off. The live list is read from the page's bulk-plant select.
+CROP_ID = int(os.environ.get("TICARISK_CROP_ID", "4"))
+
+# Bulk-plant rotation. 1 = walk the crop list forward one step per planting
+# round (Wheat -> Potato -> Carrot -> ... ), 0 = always plant CROP_ID.
+CROP_ROTATION = os.environ.get("TICARISK_CROP_ROTATION", "1") == "1"
+ROTATION_FILE = os.environ.get("TICARISK_ROTATION_FILE", "crop_rotation.json")
+
+# Animal sections also spend feed. Set to 0 to harvest only.
+FEED_ANIMALS = os.environ.get("TICARISK_FEED_ANIMALS", "1") == "1"
+
+# Beekeeping: bal_hasat burns the honeycomb, so each cycle has to buy them
+# back at $1,500 each. 0 = harvest only, never buy.
+PETEK_REFILL = os.environ.get("TICARISK_PETEK_REFILL", "1") == "1"
+PETEK_MAX_SPEND = float(os.environ.get("TICARISK_PETEK_MAX_SPEND", "60000"))
+PETEK_PRICE = 1500
+
+# Never bought unless > 0. One field needs 150 L at $120/L = $18,000.
+BUY_WATER_LITERS = int(os.environ.get("TICARISK_BUY_WATER_LITERS", "0"))
+MAX_WATER_SPEND = float(os.environ.get("TICARISK_MAX_WATER_SPEND", "0"))  # 0 = no cap
+
+# Raw materials that stall a business when they run dry. Format, comma
+# separated:  material_id:trigger:usd_cap   — buy up to `trigger` units when
+# stock is under `trigger`, never spending more than `usd_cap` in one go.
+# Cement/Cyanide/Acid/Silicon are NOT on the market; they come from factories.
+RESTOCK_SPEC = os.environ.get(
+    "TICARISK_RESTOCK",
+    "besi_yemi:500:40000,kumes_yemi:2000:20000,besi_suyu:2000:15000",
+)
+MAX_RESTOCK_SPEND = float(os.environ.get("TICARISK_MAX_RESTOCK_SPEND", "100000"))
+RESTOCK_LEDGER = os.environ.get("TICARISK_RESTOCK_LEDGER", "restock_spend.json")
+
+def _parse_restock(raw: str) -> List[Tuple[str, int, float]]:
+    out: List[Tuple[str, int, float]] = []
+    for part in raw.split(","):
+        bits = [b.strip() for b in part.split(":")]
+        if len(bits) == 3 and bits[0]:
+            try:
+                out.append((bits[0], int(bits[1]), float(bits[2])))
+            except ValueError:
+                log.warning("ignoring bad TICARISK_RESTOCK entry: %r", part)
+    return out
+
+
+RESTOCK = _parse_restock(RESTOCK_SPEC)
+
+PAUSE = float(os.environ.get("TICARISK_PAUSE", "1.2"))  # between requests
+REQUEST_TIMEOUT = float(os.environ.get("TICARISK_TIMEOUT", "30"))
+
+DRY_RUN = False
+
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+XHR = {"X-Requested-With": "XMLHttpRequest"}
+JSON_HDR = {"Accept": "application/json, text/plain, */*", **XHR}
+
+log = logging.getLogger("ticarisk")
+
+
+# --------------------------------------------------------------------------- result
+
+
+@dataclass
+class Step:
+    section: str
+    action: str
+    ok: bool
+    detail: str = ""
+    soft: bool = False  # refused by game state (missing materials, ...) not a malfunction
+
+    def line(self) -> str:
+        mark = "ok  " if self.ok else ("warn" if self.soft else "FAIL")
+        tail = f" — {self.detail}" if self.detail else ""
+        return f"[{mark}] {self.section}: {self.action}{tail}"
+
+
+@dataclass
+class Cycle:
+    steps: List[Step] = field(default_factory=list)
+
+    def add(
+        self, section: str, action: str, ok: bool, detail: str = "", soft: bool = False
+    ) -> Step:
+        s = Step(section, action, ok, detail, soft)
+        self.steps.append(s)
+        log.info(s.line())
+        return s
+
+    @property
+    def failed(self) -> List[Step]:
+        return [s for s in self.steps if not s.ok and not s.soft]
+
+    @property
+    def warned(self) -> List[Step]:
+        return [s for s in self.steps if not s.ok and s.soft]
+
+
+# --------------------------------------------------------------------------- http
+
+
+def _dedupe_cookies(sess: requests.Session) -> None:
+    """Drop duplicate cookie names. Two PHPSESSIDs mean the server validates a
+    session that never saw the CSRF token — every action then returns
+    'Security error' / 'CSRF token validation failed'."""
+    by_name: Dict[str, list] = {}
+    for c in list(sess.cookies):
+        by_name.setdefault(c.name, []).append(c)
+    for name, group in by_name.items():
+        if len(group) < 2:
+            continue
+        # keep the most specific domain, drop the rest
+        group.sort(key=lambda c: len(c.domain or ""), reverse=True)
+        for c in group[1:]:
+            try:
+                sess.cookies.clear(c.domain, c.path, c.name)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        log.debug("collapsed %d cookies named %s", len(group), name)
+
+
+def login() -> requests.Session:
+    if not USER or not PASSWORD:
+        raise SystemExit("TICARISK_USER / TICARISK_PASS are not set")
+
+    sess = requests.Session()
+    sess.headers.update(
+        {
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
+    sess.get(f"{BASE}/login.php", timeout=REQUEST_TIMEOUT, verify=False)
+    sess.post(
+        f"{BASE}/login.php",
+        data={"login": USER, "password": PASSWORD, "remember": "on"},
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+        verify=False,
+    )
+    _dedupe_cookies(sess)
+
+    home = sess.get(f"{BASE}/index.php", timeout=REQUEST_TIMEOUT, verify=False)
+    if "login.php" in home.url or USER not in home.text:
+        raise SystemExit("login failed — check TICARISK_USER / TICARISK_PASS")
+    log.info("logged in as %s", USER)
+    return sess
+
+
+def get(sess: requests.Session, path: str, **kw) -> str:
+    kw.setdefault("timeout", REQUEST_TIMEOUT)
+    kw.setdefault("verify", False)
+    r = sess.get(BASE + path, **kw)
+    r.raise_for_status()
+    return r.text
+
+
+def post(
+    sess: requests.Session,
+    path: str,
+    data,
+    hdr=None,
+    mutating: bool = True,
+    pause: bool = True,
+    **kw,
+):
+    kw.setdefault("timeout", REQUEST_TIMEOUT)
+    kw.setdefault("verify", False)
+    if mutating and DRY_RUN:
+        log.info("dry-run: skip POST %s %s", path, data)
+        return {"success": True, "message": "dry-run — skipped"}
+    headers = dict(XHR)
+    headers.update(hdr or {})
+    if pause:
+        time.sleep(PAUSE)
+    r = sess.post(BASE + path, data=data, headers=headers, **kw)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except ValueError:
+        return {"success": False, "message": r.text[:200]}
+
+
+# Server messages that mean "nothing to do right now", not a malfunction.
+BENIGN_RE = re.compile(
+    r"(?:"
+    r"you (?:have|do not own|don't have|don&#039;t have)"
+    r"|no businesses"
+    r"|nothing (?:ready|to)"
+    r"|are not ready"
+    r"|not waiting for watering"
+    r"|no suitable field found"
+    r"|no empty field"
+    r"|no income or goods could be collected"
+    r"|honey is not ready"
+    r"|no operations available"
+    r"|all animals are already fed"
+    r"|no harvestable trees"
+    r"|no ready products"
+    r"|already fed"
+    r"|no animals waiting for feed"
+    r"|no animals awaiting feed"
+    r"|hourly round limit"
+    r"|limit reached"
+    r"|try again next hour"
+    r")",
+    re.I,
+)
+
+# Per-item "Errors:" suffixes that are still just an empty state. Any other
+# item is a real problem and must stay visible.
+OK_ITEM_RE = re.compile(
+    r"no harvestable trees|not ready|no ready products|already fed|not waiting|nothing to",
+    re.I,
+)
+
+
+def ok(res) -> bool:
+    if not isinstance(res, dict):
+        return False
+    if res.get("success"):
+        return True
+    text = str(res.get("message") or "")
+    if "Errors:" in text:
+        items = [i.strip() for i in re.split(r",\s*", text.split("Errors:", 1)[1]) if i.strip()]
+        # every reported item benign -> the call was fine, the game just had nothing to give
+        return bool(items) and all(OK_ITEM_RE.search(i) for i in items)
+    return bool(BENIGN_RE.search(text))
+
+
+# Game-state refusals: the request was understood and correctly authenticated,
+# the account simply cannot perform it right now. Reported, but not a failure.
+SOFT_RE = re.compile(
+    r"not enough materials|need: |already (?:producing|running)|nothing to collect",
+    re.I,
+)
+
+
+def msg(res) -> str:
+    return str((res or {}).get("message") or (res or {}).get("error") or res or "")
+
+
+def balance(sess: requests.Session) -> Optional[float]:
+    try:
+        html = get(sess, "/index.php")
+    except Exception:
+        return None
+    m = re.search(r"nav-stat-balance'[^>]*data-value='(-?[\d.]+)'", html)
+    return float(m.group(1)) if m else None
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def field_states(html: str) -> Dict[str, str]:
+    """tarla-id -> data-durum (bos | ekilmis | hasat_hazir | buyuyor)."""
+    out: Dict[str, str] = {}
+    for tag in re.findall(r"<div class=\"tarla-item\"[^>]*>", html):
+        fid = re.search(r'data-tarla-id="(\d+)"', tag)
+        dur = re.search(r'data-durum="([a-z_]+)"', tag)
+        if fid:
+            out[fid.group(1)] = dur.group(1) if dur else "unknown"
+    if out:
+        return out
+    # attribute-order tolerant fallback
+    for m in re.finditer(r'data-tarla-id="(\d+)"', html):
+        window = html[m.start(): m.start() + 300]
+        dur = re.search(r'data-durum="([a-z_]+)"', window)
+        if dur and m.group(1) not in out:
+            out[m.group(1)] = dur.group(1)
+    return out
+
+
+def owned_ids(html: str, attr: str) -> List[str]:
+    return sorted(set(re.findall(r'data-%s-id="(\d+)"' % attr, html)), key=int)
+
+
+def crop_options(html: str) -> Dict[int, str]:
+    """Crop id -> crop name, in the order the page lists them.
+
+    Prefers the bulk-plant select (#topluEkimUrun): one line per option and
+    data-seviye / data-sure attributes. Falls back to the single-field
+    #urun_id select, which is the same list laid out over several lines.
+    """
+    for sel_id in ("topluEkimUrun", "urun_id"):
+        box = re.search(r'id="%s".*?</select>' % sel_id, html, re.S)
+        if not box:
+            continue
+        out: Dict[int, str] = {}
+        for i, raw in re.findall(r'<option value="(\d+)"[^>]*>\s*([^<]+)', box.group(0)):
+            name = re.split(r"\s*\(", raw, 1)[0].strip()
+            if name:
+                out[int(i)] = name
+        if out:
+            return out
+    return {}
+
+
+def planted_crops(html: str) -> List[str]:
+    """Crop names currently in the ground, from each field's title line."""
+    out: List[str] = []
+    for title in re.findall(r'<h5 class="tarla-baslik">\s*([^<]+?)\s*</h5>', html):
+        name = re.sub(r"\s+Planted\s*$", "", title.strip(), flags=re.I).strip()
+        if name and name.lower() not in ("empty", "empty field", "bo\u015f"):
+            out.append(name)
+    return out
+
+
+def _read_rotation(path: str) -> Optional[int]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return int(json.load(fh).get("next_index"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _write_rotation(path: str, idx: int) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"next_index": idx}, fh)
+    except OSError as exc:  # read-only workspace (CI) — fall back to state seeding
+        log.debug("rotation cursor not saved: %s", exc)
+
+
+def pick_crop(opts: Dict[int, str], html: str) -> Tuple[int, str, str]:
+    """(crop id, name, why) for the next bulk planting.
+
+    The cursor is a small file so consecutive local runs walk forward. In a
+    fresh checkout (GitHub Actions) there is no file, so the starting point is
+    re-derived from the field page: start *after* whatever is growing now.
+    Either way successive rounds land on a different crop instead of the same
+    one forever.
+    """
+    ids = list(opts)
+    if not ids:
+        return CROP_ID, str(CROP_ID), "no crop list parsed"
+
+    if not CROP_ROTATION:
+        i = ids.index(CROP_ID) if CROP_ID in ids else 0
+        return ids[i], opts[ids[i]], "rotation off"
+
+    stored = _read_rotation(ROTATION_FILE)
+    if stored is not None:
+        i = stored % len(ids)
+        src = "stored cursor"
+    else:
+        names = list(opts.values())
+        grown = planted_crops(html)
+        if grown:
+            common = Counter(grown).most_common(1)[0][0]
+            i = (names.index(common) + 1) % len(names) if common in names else 0
+            src = "seeded after %s" % common
+        else:
+            i = 0
+            src = "seeded (nothing growing)"
+    if not DRY_RUN:  # a dry run must not consume the cursor
+        _write_rotation(ROTATION_FILE, (i + 1) % len(ids))
+    return ids[i], opts[ids[i]], src
+
+
+# A crop the field's level will not accept. Anything else is a different problem.
+LEVEL_BLOCKED_RE = re.compile(
+    r"level|seviye|unlock|locked|not (?:yet )?available|Sv\.\d|require", re.I
+)
+
+
+def animal_tasks(html: str, id_attr: str) -> List[Tuple[str, str, str]]:
+    """(building_id, hayvan_turu, urun_tipi) triples found on action buttons."""
+    seen: List[Tuple[str, str, str]] = []
+    for m in re.finditer(r"<[^>]+data-hayvan-turu=\"([^\"]+)\"[^>]*>", html):
+        tag = m.group(0)
+        hid = re.search(r'data-%s-id="(\d+)"' % id_attr, tag)
+        if not hid:
+            continue
+        ut = re.search(r'data-urun-tipi="([^"]*)"', tag)
+        key = (hid.group(1), m.group(1), ut.group(1) if ut else "")
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def lazy(sess: requests.Session, panel: str) -> dict:
+    r = sess.get(
+        f"{BASE}/businesses.php",
+        params={"ajax_lazy": panel},
+        headers=JSON_HDR,
+        timeout=REQUEST_TIMEOUT,
+        verify=False,
+    )
+    r.raise_for_status()
+    try:
+        return r.json()
+    except ValueError:
+        return {"success": False, "message": r.text[:200]}
+
+
+def dump(path: str, content) -> None:
+    """Write a page dump (str) or a binary payload (bytes) into inspect/."""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if isinstance(content, (bytes, bytearray)):
+            with open(path, "wb") as fh:
+                fh.write(bytes(content))
+        else:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+    except OSError as exc:  # pragma: no cover
+        log.warning("could not write %s: %s", path, exc)
+
+
+# --------------------------------------------------------------------------- production
+
+
+def section_production(sess, cyc: Cycle, inspect: bool) -> None:
+    # Cards are server-rendered plain forms: csrf_token + business_id + a submit
+    # button named collect_all or start_production. No product/slot arguments.
+    page = get(sess, "/businesses.php")
+    if inspect:
+        dump("inspect/businesses.html", page)
+
+    # 1 — collect everything (one bulk call, no captcha involved)
+    res = post(
+        sess,
+        "/businesses.php",
+        {"action": "toplu_tum_isletme_topla", "csrf_token": csrf_of(page)},
+        hdr={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    cyc.add("production", "collect all", ok(res), msg(res))
+    if inspect:
+        dump("inspect/production_collect.json", _pretty(res))
+
+    # re-read: collection clears the Collect buttons and leaves idle cards
+    page = get(sess, "/businesses.php")
+    owned = lazy(sess, "owned_bundle")
+    if inspect:
+        dump(
+            "inspect/production_owned.html",
+            (owned.get("factories") or "") + (owned.get("food") or ""),
+        )
+
+    sources = [
+        ("mines", page),
+        ("factories", owned.get("factories") or ""),
+        ("food", owned.get("food") or ""),
+    ]
+    forms = [(label, *f) for label, src in sources for f in action_forms(src)]
+
+    # per-card collect is only worth the requests when the bulk call failed
+    if not ok(res):
+        for label, bid, btn, tok in [f for f in forms if f[2] == "collect_all"]:
+            r2 = post(
+                sess,
+                "/businesses.php",
+                {"csrf_token": tok, "business_id": bid, btn: "1"},
+            )
+            cyc.add(
+                "production",
+                f"collect {bid} ({label})",
+                ok(r2),
+                msg(r2),
+                soft=not ok(r2) and SOFT_RE.search(str(msg(r2))) is not None,
+            )
+
+    starts = [f for f in forms if f[2] == "start_production"]
+    if not starts:
+        cyc.add("production", "restart", True, "no idle production slot found")
+    else:
+        for label, bid, _btn, tok in starts:
+            r2 = post(
+                sess,
+                "/businesses.php",
+                {"csrf_token": tok, "business_id": bid, "start_production": "1"},
+            )
+            good = ok(r2)
+            cyc.add(
+                "production",
+                f"start {bid} ({label})",
+                good,
+                msg(r2),
+                soft=(not good) and SOFT_RE.search(str(msg(r2))) is not None,
+            )
+
+    _restock(sess, cyc)
+
+
+# --------------------------------------------------------------------------- farm
+
+
+def section_fields(sess, cyc: Cycle, inspect: bool) -> None:
+    # let the server flip any timers that just elapsed
+    res = post(
+        sess, "/tarlalar.php", {"ajax_request": 1, "check_tarla_status": 1}, mutating=False
+    )
+    log.debug("check_tarla_status: %s", msg(res))
+
+    html = get(sess, "/tarlalar.php")
+    if inspect:
+        dump("inspect/tarlalar.html", html)
+    states = field_states(html)
+    if not states:
+        cyc.add("fields", "scan", True, "no fields owned")
+        return
+
+    counts: Dict[str, int] = {}
+    for st in states.values():
+        counts[st] = counts.get(st, 0) + 1
+    log.info("fields: %s", ", ".join(f"{v}x {k}" for k, v in sorted(counts.items())))
+
+    ready = [i for i, st in states.items() if st in ("hasat_hazir", "hazir", "ready")]
+    if ready:
+        res = post(
+            sess,
+            "/tarlalar.php",
+            {"ajax_request": 1, "toplu_hasat": 1, "tarla_ids[]": ready},
+        )
+        cyc.add("fields", f"harvest {len(ready)}", ok(res), msg(res))
+    else:
+        cyc.add("fields", "harvest", True, "nothing ready")
+
+    # re-read: harvested fields come back empty and can be replanted now
+    html = get(sess, "/tarlalar.php")
+    states = field_states(html)
+    empty = [i for i, st in states.items() if st in ("bos", "empty", "")]
+    if not empty:
+        cyc.add("fields", "replant", True, "no empty field")
+        return
+
+    opts = crop_options(html)
+    crop, label, why = pick_crop(opts, html)
+
+    def plant(cid: int):
+        return post(
+            sess,
+            "/tarlalar.php",
+            {"ajax_request": 1, "toplu_ekim": 1, "urun_id": cid, "tarla_ids[]": empty},
+        )
+
+    res = plant(crop)
+    cyc.add("fields", f"plant {label} on {len(empty)} ({why})", ok(res), msg(res))
+
+    # a crop above this field's Sv level is refused — walk the rotation forward
+    # until the server takes one, rather than getting stuck on it every hour
+    tried = [crop]
+    while not ok(res) and opts and LEVEL_BLOCKED_RE.search(str(msg(res))):
+        nxt = next((c for c in opts if c not in tried), None)
+        if nxt is None:
+            break
+        tried.append(nxt)
+        crop, label = nxt, opts[nxt]
+        res = plant(nxt)
+        cyc.add("fields", f"plant {label} (rotation fallback)", ok(res), msg(res))
+
+    if not ok(res) and "water" in msg(res).lower():
+        if _maybe_buy_water(sess, cyc):
+            res = plant(crop)
+            cyc.add("fields", f"replant {label}", ok(res), msg(res))
+
+
+def _market_html(sess: requests.Session) -> str:
+    return get(sess, "/hammaddeler.php")
+
+
+def _listing(html: str, mid: str) -> Optional[dict]:
+    """Read the buy button for one raw material.
+
+    The button carries everything the POST needs and every cap the server will
+    enforce: price, csrf, current stock, warehouse max, daily limit and how
+    much of that limit is already used.
+    """
+    for m in re.finditer(r"<button\b[^>]*>", html):
+        tag = m.group(0)
+        if f'data-material-id="{mid}"' not in tag:
+            continue
+
+        def g(k: str, d: str = "") -> str:
+            r = re.search(rf'data-{k}="([^"]*)"', tag)
+            return r.group(1) if r else d
+
+        def n(k: str) -> int:
+            try:
+                return int(g(k, "0") or 0)
+            except ValueError:
+                return 0
+
+        return {
+            "id": mid,
+            "name": g("material-name", mid),
+            "unit": g("unit", ""),
+            "price": n("price"),
+            "csrf": g("csrf"),
+            "stock": n("current-amount"),
+            "max": n("max"),
+            "dlimit": n("daily-limit"),
+            "dtaken": n("daily-taken"),
+        }
+    return None
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _ledger() -> dict:
+    try:
+        with open(RESTOCK_LEDGER, "r") as fh:
+            d = json.load(fh)
+    except Exception:
+        d = {}
+    if d.get("day") != _today():
+        d = {"day": _today(), "spend": 0.0}
+    try:
+        d["spend"] = float(d.get("spend", 0.0))
+    except (TypeError, ValueError):
+        d["spend"] = 0.0
+    return d
+
+
+def _ledger_add(amount: float) -> float:
+    d = _ledger()
+    d["spend"] += amount
+    try:
+        with open(RESTOCK_LEDGER, "w") as fh:
+            json.dump(d, fh)
+    except Exception as exc:
+        log.debug("restock ledger not written: %s", exc)
+    return d["spend"]
+
+
+def _buy_material(
+    sess: requests.Session,
+    cyc: Cycle,
+    step: str,
+    mid: str,
+    want: int,
+    max_spend: float,
+    html: Optional[str] = None,
+) -> bool:
+    """Buy `want` units of a raw material.
+
+    Quantity is clamped by, in order: the warehouse free space, the server's
+    daily limit, our own USD cap, and the account balance. Any of them hitting
+    zero ends the buy with a reason instead of posting a doomed request.
+    """
+    try:
+        L = _listing(html if html is not None else _market_html(sess), mid)
+    except Exception as exc:
+        cyc.add(step, f"buy {mid}", False, str(exc))
+        return False
+    if not L or not L["csrf"]:
+        cyc.add(step, f"buy {mid}", False, "listing not found on the market page")
+        return False
+    if L["price"] <= 0:
+        cyc.add(step, f"buy {L['name']}", False, "no price on the listing")
+        return False
+
+    price, qty = L["price"], int(want)
+    room_stock = max(L["max"] - L["stock"], 0) if L["max"] else qty
+    room_daily = max(L["dlimit"] - L["dtaken"], 0) if L["dlimit"] else qty
+    qty = min(qty, room_stock, room_daily)
+    if max_spend > 0:
+        qty = min(qty, int(max_spend // price))
+    bal = balance(sess)
+    if bal is not None:
+        qty = min(qty, int(bal // price))
+
+    label = f"{L['name']} ({mid})"
+    if qty <= 0:
+        why = (
+            "warehouse full"
+            if room_stock <= 0
+            else "daily limit used up"
+            if room_daily <= 0
+            else "spend cap or balance"
+        )
+        cyc.add(step, f"buy {label}", True, f"skipped — {why}")
+        return False
+
+    res = post(
+        sess,
+        "/hammaddeler.php",
+        {"csrf_token": L["csrf"], "material_id": mid, "quantity": qty, "buy_material": "1"},
+    )
+    good = ok(res)
+    cyc.add(step, f"buy {qty} {L['unit']} {L['name']}", good, msg(res))
+    if good:
+        _ledger_add(qty * price)
+    return good
+
+
+def _maybe_buy_water(sess, cyc: Cycle) -> bool:
+    if BUY_WATER_LITERS <= 0:
+        cyc.add("fields", "buy water", True, "skipped (TICARISK_BUY_WATER_LITERS=0)")
+        return False
+    return _buy_material(sess, cyc, "fields", "su", BUY_WATER_LITERS, MAX_WATER_SPEND)
+
+
+def _restock(sess, cyc: Cycle) -> None:
+    """Top up the materials that idle a business when they run out.
+
+    Only buys when stock is actually under its trigger, so a healthy hour
+    produces no market traffic at all. The whole day is additionally capped by
+    TICARISK_MAX_RESTOCK_SPEND via the ledger file.
+    """
+    if not RESTOCK:
+        cyc.add("production", "restock", True, "disabled (TICARISK_RESTOCK is empty)")
+        return
+
+    spent = _ledger()["spend"]
+    if MAX_RESTOCK_SPEND > 0 and spent >= MAX_RESTOCK_SPEND:
+        cyc.add(
+            "production",
+            "restock",
+            True,
+            f"daily restock cap reached — ${spent:,.0f} of ${MAX_RESTOCK_SPEND:,.0f}",
+        )
+        return
+
+    try:
+        html = _market_html(sess)
+    except Exception as exc:
+        cyc.add("production", "restock", False, str(exc))
+        return
+
+    healthy, bought, short = [], 0, []
+    for mid, trigger, cap in RESTOCK:
+        budget = MAX_RESTOCK_SPEND - spent if MAX_RESTOCK_SPEND > 0 else cap
+        if budget <= 0:
+            short.append("daily cap reached")
+            break
+        L = _listing(html, mid)
+        if not L:
+            short.append(f"{mid}: listing not found")
+            continue
+        if L["stock"] >= trigger:
+            healthy.append(f"{L['name']} {L['stock']}")
+            continue
+        if _buy_material(sess, cyc, "restock", mid, trigger, min(cap, budget), html=html):
+            bought += 1
+            spent = _ledger()["spend"]
+        else:
+            short.append(f"{L['name']} {L['stock']}<{trigger}")
+
+    if bought == 0:
+        detail = "healthy: " + (", ".join(healthy) or "—")
+        if short:
+            detail += " | not bought: " + ", ".join(short)
+        cyc.add("production", "restock", True, detail)
+
+
+def section_orchards(sess, cyc: Cycle, inspect: bool) -> None:
+    try:
+        post(
+            sess, "/bahceler.php", {"ajax_request": 1, "check_plants_status": 1}, mutating=False
+        )
+    except Exception as exc:
+        log.debug("check_plants_status: %s", exc)
+
+    html = get(sess, "/bahceler.php")
+    if inspect:
+        dump("inspect/bahceler.html", html)
+    ids = owned_ids(html, "bahce")
+    if not ids:
+        cyc.add("orchards", "scan", True, "no orchards owned")
+        return
+
+    res = post(
+        sess,
+        "/bahceler.php",
+        {"ajax_request": 1, "toplu_meyve_topla_coklu": 1, "bahce_ids[]": ids},
+    )
+    cyc.add("orchards", f"harvest {len(ids)}", ok(res), msg(res))
+
+    res = post(
+        sess,
+        "/bahceler.php",
+        {"ajax_request": 1, "toplu_bahce_sula": 1, "bahce_ids[]": ids},
+    )
+    cyc.add("orchards", f"water {len(ids)}", ok(res), msg(res))
+
+
+def _animals(sess, cyc: Cycle, inspect: bool, section: str, path: str, attr: str) -> None:
+    url = f"/{path}.php"
+    html = get(sess, url)
+    if inspect:
+        dump(f"inspect/{path}.html", html)
+    ids = owned_ids(html, attr)
+    if not ids:
+        cyc.add(section, "scan", True, f"no {section} owned")
+        return
+
+    tasks = animal_tasks(html, attr)
+    if tasks:
+        for hid, tur, urun in tasks:
+            res = post(
+                sess,
+                url,
+                {
+                    "ajax_request": 1,
+                    "toplu_urun_topla": 1,
+                    f"{attr}_id": hid,
+                    "hayvan_turu": tur,
+                    # the barn endpoint always sends urun_tipi (possibly empty), like the site
+                    **({"urun_tipi": urun} if (urun or attr == "ahir") else {}),
+                },
+            )
+            cyc.add(section, f"collect {hid}/{tur}", ok(res), msg(res))
+            if FEED_ANIMALS:
+                res = post(
+                    sess,
+                    url,
+                    {"ajax_request": 1, "toplu_besle": 1, f"{attr}_id": hid, "hayvan_turu": tur},
+                )
+                cyc.add(section, f"feed {hid}/{tur}", ok(res), msg(res))
+        return
+
+    if not FEED_ANIMALS:
+        cyc.add(
+            section,
+            "collect",
+            True,
+            "no per-animal buttons found and feeding disabled — nothing safe to call",
+        )
+        return
+
+    # single "do everything" call (feed + collect, never sells)
+    for hid in ids:
+        res = post(sess, url, {"ajax_request": 1, "tum_islemler": 1, f"{attr}_id": hid})
+        cyc.add(section, f"feed+collect {hid}", ok(res), msg(res))
+
+
+def bee_areas(html: str) -> Dict[int, Dict[str, int]]:
+    """aricilik_id -> {hives, petek, max_petek}.
+
+    The ids exist only inside the buy-button onclick handlers
+    (kovanAlModal(3179, 4, 0) / petekAlModal(3179, 4, 40)). There is no
+    data-aricilik-id attribute anywhere on the page, which is why a scan for
+    it reported "no beekeeping area owned" on an account that has one.
+    """
+    out: Dict[int, Dict[str, int]] = {}
+    for i, tl, _diamond in re.findall(
+        r"kovanAlModal\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", html
+    ):
+        d = out.setdefault(int(i), {"hives": 0, "petek": 0, "max_petek": 0})
+        d["hives"] += int(tl)  # cash hives; diamond hives are a separate 100-limit pool
+    for i, hives, mevcut in re.findall(
+        r"petekAlModal\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", html
+    ):
+        d = out.setdefault(int(i), {"hives": 0, "petek": 0, "max_petek": 0})
+        d["hives"] = max(d["hives"], int(hives))
+        d["petek"] = int(mevcut)
+    for d in out.values():
+        d["max_petek"] = d["hives"] * 10  # site rule: maxPetek = kovanSayisi * 10
+    return out
+
+
+def section_bees(sess, cyc: Cycle, inspect: bool) -> None:
+    html = get(sess, "/aricilik.php")
+    if inspect:
+        dump("inspect/aricilik.html", html)
+    areas = bee_areas(html)
+    if not areas:
+        cyc.add("bees", "scan", True, "no beekeeping area owned")
+        return
+
+    for aid in sorted(areas):
+        res = post(sess, "/aricilik.php", {"ajax_request": 1, "bal_hasat": 1, "aricilik_id": aid})
+        cyc.add("bees", f"harvest {aid}", ok(res), msg(res))
+
+    if not PETEK_REFILL:
+        cyc.add("bees", "refill comb", True, "skipped (TICARISK_PETEK_REFILL=0)")
+        return
+
+    # Harvesting burns the honeycomb, so the count on screen only drops once a
+    # harvest actually went through. Re-read the page and top back up to the
+    # hive limit — if the harvest did not consume anything, this is a no-op.
+    html = get(sess, "/aricilik.php")
+    if inspect:
+        dump("inspect/aricilik_after.html", html)
+    for aid, st in sorted(bee_areas(html).items()):
+        want = max(0, st["max_petek"] - st["petek"])
+        if want <= 0:
+            cyc.add("bees", f"comb {aid}", True, f"full ({st['petek']}/{st['max_petek']})")
+            continue
+        cost = want * PETEK_PRICE
+        if cost > PETEK_MAX_SPEND:
+            cyc.add(
+                "bees",
+                f"buy {want} comb",
+                False,
+                f"${cost:,} exceeds TICARISK_PETEK_MAX_SPEND=${PETEK_MAX_SPEND:,.0f}",
+                soft=True,
+            )
+            continue
+        bal = balance(sess)
+        if bal is not None and cost > bal:
+            cyc.add(
+                "bees",
+                f"buy {want} comb",
+                False,
+                f"cost ${cost:,} is above the ${bal:,.2f} balance",
+                soft=True,
+            )
+            continue
+        res = post(
+            sess,
+            "/aricilik.php",
+            {"ajax_request": 1, "petek_ekle": 1, "aricilik_id": aid, "petek_adet": want},
+        )
+        cyc.add("bees", f"buy {want} comb (${cost:,})", ok(res), msg(res))
+
+
+
+
+# --------------------------------------------------------------------------- misc
+
+
+def _pretty(obj) -> str:
+    import json
+
+    try:
+        return json.dumps(obj, indent=2, ensure_ascii=False)
+    except TypeError:
+        return str(obj)
+
+
+def csrf_of(html: str) -> str:
+    m = re.search(r'data-csrf="([0-9a-f]{64})"', html)
+    if not m:
+        raise SystemExit("could not find the businesses CSRF token")
+    return m.group(1)
+
+
+def action_forms(src: str) -> List[Tuple[str, str, str]]:
+    """(business_id, button_name, csrf) for every server-rendered action form.
+
+    Each card embeds its own csrf_token, and tokens rotate per render, so the
+    token carried out of the very form we are about to submit is the safe one.
+    """
+    out: List[Tuple[str, str, str]] = []
+    for f in re.findall(r"<form[^>]*>.*?</form>", src, re.S):
+        bid = re.search(r'name="business_id"\s+value="(\d+)"', f)
+        btn = re.search(r'<button[^>]*name="([a-z_]+)"', f)
+        tok = re.search(r'name="csrf_token"\s+value="([0-9a-f]{64})"', f)
+        if bid and btn and tok:
+            out.append((bid.group(1), btn.group(1), tok.group(1)))
+    return out
+
+
+# --------------------------------------------------------------------------- captcha
+#
+# The game gates matematik.php behind a slider puzzle. It is the same
+# generate_puzzle / verify_human pair the browser bundle uses, and the
+# `user_position` it wants is a PERCENT of the background width, not pixels.
+
+
+def _im_load(data: bytes):
+    """Decode an image to a float HxWx3 array using ImageMagick (no PIL here)."""
+    if np is None:
+        raise RuntimeError("numpy is required for captcha solving")
+    fd, path = tempfile.mkstemp(suffix=".img")
+    rgb = path + ".rgb"
+    try:
+        os.write(fd, data)
+        os.close(fd)
+        fd = -1
+        dim = subprocess.run(
+            ["identify", "-format", "%w %h", path], capture_output=True, text=True, timeout=60
+        )
+        parts = dim.stdout.split()
+        if len(parts) < 2:
+            raise RuntimeError(f"identify failed: {dim.stderr[:200]}")
+        w, h = int(parts[0]), int(parts[1])
+        subprocess.run(
+            ["convert", path, "-depth", "8", f"rgb:{rgb}"],
+            check=True, capture_output=True, timeout=60,
+        )
+        arr = np.fromfile(rgb, dtype=np.uint8)[: w * h * 3]
+        if arr.size < w * h * 3:
+            raise RuntimeError("short pixel read from convert")
+        return arr.reshape(h, w, 3).astype(float), w, h
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        for junk in (path, rgb):
+            if os.path.exists(junk):
+                try:
+                    os.remove(junk)
+                except OSError:
+                    pass
+
+
+def _cv_profile(img):
+    return np.abs(img - 0.5 * (np.roll(img, 3, 1) + np.roll(img, -3, 1))).mean(2)
+
+
+def _ch_profile(img):
+    return np.abs(img - 0.5 * (np.roll(img, 3, 0) + np.roll(img, -3, 0))).mean(2)
+
+
+def _winmean(profile, lo, width):
+    cs = np.concatenate([[0.0], np.cumsum(profile)])
+    return (cs[np.minimum(lo + width, len(profile))] - cs[lo]) / width
+
+
+def score_positions(img, pw, ph, py, margin=4, topk=8):
+    """Rank candidate x positions by how well a box outline fits the hole."""
+    h, w, _ = img.shape
+    CV, CH = _cv_profile(img), _ch_profile(img)
+
+    y0, y1 = max(0, py), min(h, py + ph)
+    col = CV[y0:y1].mean(0)
+    topP = CH[max(0, py - 1):min(h, py + 2)].mean(0)
+    botP = CH[max(0, py + ph - 1):min(h, py + ph + 2)].mean(0)
+
+    lo = np.arange(margin, max(margin + 1, w - margin - pw))
+    win = max(4, pw - 2 * margin)
+    score = col[lo] + col[lo + pw] + _winmean(topP, lo, win) + _winmean(botP, lo, win)
+
+    yT, yB = np.clip(py, 0, h - 3), np.clip(py + ph - 3, 0, h - 3)
+    order = np.argsort(-score)[: max(topk * 12, 72)]
+    bonus = np.zeros_like(score)
+    for k in order:
+        L = int(lo[k])
+        if L - 1 < 0 or L + pw + 2 > w:
+            continue
+        cl = img[y0:y1, L - 1:L + 2].reshape(-1, 3).mean(0)
+        cr = img[y0:y1, L + pw - 1:L + pw + 2].reshape(-1, 3).mean(0)
+        ct = img[yT:yT + 3, L + margin:L + pw - margin].reshape(-1, 3).mean(0)
+        cb = img[yB:yB + 3, L + margin:L + pw - margin].reshape(-1, 3).mean(0)
+        spread = float(np.array([cl, cr, ct, cb]).std(0).mean())
+        bonus[k] = max(0.0, 70.0 - spread)
+
+    total = score + 1.6 * bonus
+    idx = np.argsort(-total)[:topk]
+    return [(int(lo[i]), float(score[i]), float(total[i])) for i in idx]
+
+
+def pct_of(L: float, w: int, pw: int) -> float:
+    return max(0.0, min(100.0, ((L + pw / 2) - pw / 2) / w * 100.0))
+
+
+def _runs(mask, minlen):
+    out, start = [], None
+    for i, v in enumerate(list(mask) + [False]):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if i - start >= minlen:
+                out.append((start, i - 1, i - start))
+            start = None
+    return out
+
+
+def edge_candidates(img, pw, ph, py, topk=6):
+    """Run-pairing rectangle finder — the userscript's detectCandidates."""
+    h, w = img.shape[:2]
+    Eh = np.abs(img[3:] - img[:-3]).mean(2)
+    Ev = np.abs(img[:, 3:] - img[:, :-3]).mean(2)
+    band_lo = max(0, py - 25)
+    band_hi = min(min(h - 3, Ev.shape[0]), py + ph + 25)
+    min_v = max(30, int(ph * 0.55))
+    min_h = int(pw * 0.55)
+    span_ok = lambda s: pw - 8 <= s <= pw + 12
+
+    out, seen = [], set()
+    for T in (45, 35, 26, 20):
+        vedges, hedges = [], []
+        for x in range(Ev.shape[1]):
+            for y0, y1, L in _runs(Ev[band_lo:band_hi, x] > T, min_v):
+                vedges.append((x, y0 + band_lo, y1 + band_lo, L))
+        for y in range(band_lo, min(band_hi, Eh.shape[0])):
+            for x0, x1, L in _runs(Eh[y] > T, min_h):
+                hedges.append((y, x0, x1, L))
+
+        for i in range(len(hedges)):
+            for j in range(i + 1, len(hedges)):
+                a, b = hedges[i], hedges[j]
+                lo, hi = min(a[1], b[1]), max(a[2], b[2])
+                if span_ok(hi - lo) and abs((a[1] + a[2]) - (b[1] + b[2])) <= max(8, pw * 0.3):
+                    if (lo, hi) not in seen:
+                        seen.add((lo, hi))
+                        out.append(((lo, hi), T))
+        for i in range(len(vedges)):
+            for j in range(i + 1, len(vedges)):
+                a, b = vedges[i], vedges[j]
+                if b[0] > a[0] and span_ok(b[0] - a[0]):
+                    if (a[0], b[0]) not in seen:
+                        seen.add((a[0], b[0]))
+                        out.append(((a[0], b[0]), T))
+
+    out.sort(key=lambda c: (abs((c[0][1] - c[0][0]) - pw), c[1]))
+    pcts = []
+    for (lo, hi), _T in out[:topk]:
+        box_c = (lo + hi) / 2.0
+        piece_left = box_c - pw / 2.0
+        max_pct = ((w - pw) / w) * 100.0
+        pcts.append(max(0.0, min(piece_left / w * 100.0, max_pct)))
+    return pcts
+
+
+def ncc_candidates(bg, piece, pw, ph, py, topk=5, gap=6):
+    """Match the cut piece against every slot position (normalised cross
+    correlation). This is the userscript's nccDetect and the strongest signal."""
+    if piece is None:
+        return []
+    h, w = bg.shape[:2]
+    Y, X = piece.shape[:2]
+    W, H = min(pw, X), min(ph, Y)
+    y0 = int(round(py))
+    if W < 8 or H < 8 or y0 < 0 or y0 + H > h:
+        return []
+
+    t = piece[:H, :W]
+    tm = float(t.mean())
+    tvar = float(((t - tm) ** 2).mean())
+    if tvar <= 1e-6:
+        return []
+
+    scores = np.empty(w - W + 1, dtype=float)
+    for x in range(w - W + 1):
+        win = bg[y0:y0 + H, x:x + W]
+        sm = float(win.mean())
+        svar = float(((win - sm) ** 2).mean())
+        den = (tvar * svar) ** 0.5
+        scores[x] = float(((t - tm) * (win - sm)).mean()) / den if den > 1e-6 else -1.0
+
+    max_pct = ((w - pw) / w) * 100.0
+    order = np.argsort(-scores)
+    out, picked = [], []
+    for idx in order:
+        x = int(idx)
+        if any(abs(x - q) < gap for q in picked):
+            continue
+        picked.append(x)
+        out.append(max(0.0, min(x / w * 100.0, max_pct)))
+        if len(out) >= topk:
+            break
+    return out
+
+
+def build_candidates(score_pcts, ncc_pcts, edge_pcts):
+    """Merge detectors the way the userscript does: NCC leads only when its peak
+    is clearly dominant, otherwise the 4-side scorer goes first."""
+    out, seen = [], set()
+
+    def add(pct, ):
+        if pct is None or pct != pct:
+            return
+        k = round(float(pct), 2)
+        if k in seen:
+            return
+        seen.add(k)
+        out.append(k)
+
+    n0 = ncc_pcts[0] if ncc_pcts else None
+    n1 = ncc_pcts[1] if len(ncc_pcts) > 1 else None
+    dominant = n0 is not None and n0 >= 0.55 and (n1 is None or (n0 - n1) >= 0.12)
+    if dominant:
+        add(n0)
+        add(score_pcts[0] if score_pcts else None)
+    else:
+        add(score_pcts[0] if score_pcts else None)
+        add(n0)
+    for p in score_pcts[1:]:
+        add(p)
+    for p in ncc_pcts[1:]:
+        add(p)
+    for p in edge_pcts:
+        add(p)
+    return out
+
+
+def detect_slot(bg, piece, pw, ph, py):
+    """Ordered percent guesses for the slider, best first."""
+    score_pcts = [pct_of(L, bg.shape[1], pw) for L, _s, _t in score_positions(bg, pw, ph, py)]
+    ncc_pcts = ncc_candidates(bg, piece, pw, ph, py)
+    edge_pcts = edge_candidates(bg, pw, ph, py)
+    return build_candidates(score_pcts, ncc_pcts, edge_pcts)
+
+
+def _unlock_seconds(v: dict) -> int:
+    for key in ("remaining_time", "remaining", "retry_after", "wait"):
+        try:
+            return int(float(v.get(key))) + 5
+        except (TypeError, ValueError):
+            pass
+    return 605
+
+
+def solve_puzzle(sess, path: str, cyc: Cycle) -> Tuple[bool, int]:
+    """Clear one gate. Returns (solved, guesses_spent).
+
+    Budget: CAPTCHA_GUESSES total rejected verify_human calls. Each guess uses
+    its own freshly generated puzzle, so a miss never stacks on the same
+    challenge — that stacking is what produced the 600 s lock. Give up before
+    the budget is gone rather than after.
+    """
+    if np is None:
+        cyc.add("captcha", "solve", False, "numpy not installed", soft=True)
+        return False, 0
+
+    spent = 0
+    for rnd in range(1, CAPTCHA_ROUNDS + 1):
+        if spent >= CAPTCHA_GUESSES:
+            cyc.add("captcha", "verify_human", False,
+                    f"budget used ({spent}/{CAPTCHA_GUESSES} guesses)", soft=True)
+            return False, spent
+
+        g = post(sess, path, {"ajax_request": 1, "action": "generate_puzzle"}, pause=False)
+        if not (isinstance(g, dict) and g.get("success")):
+            if isinstance(g, dict) and g.get("locked"):
+                wait = _unlock_seconds(g)
+                cyc.add("captcha", "generate", False, f"locked for {wait - 5}s: {msg(g)}", soft=True)
+                time.sleep(wait)
+                continue
+            cyc.add("captcha", "generate", False, msg(g), soft=True)
+            return False, spent
+
+        pd = g.get("puzzle_data") or {}
+        token = str(pd.get("challenge_token") or "")
+        raw_bg = str(pd.get("background_image") or "")
+        if not token or "," not in raw_bg:
+            cyc.add("captcha", "generate", False, "puzzle payload incomplete", soft=True)
+            return False, spent
+
+        pw = int(pd.get("piece_width") or 50)
+        ph = int(pd.get("piece_height") or 50)
+        py = int(pd.get("piece_y") or 0)
+        try:
+            bg, bw, _bh = _im_load(base64.b64decode(raw_bg.split(",", 1)[1]))
+            piece = None
+            raw_piece = str(pd.get("piece_image") or "")
+            if "," in raw_piece:
+                piece, _pw2, _ph2 = _im_load(base64.b64decode(raw_piece.split(",", 1)[1]))
+            guesses = detect_slot(bg, piece, pw, ph, py)
+        except Exception as exc:  # noqa: BLE001
+            cyc.add("captcha", "detect", False, str(exc), soft=True)
+            return False, spent
+        if not guesses:
+            cyc.add("captcha", "detect", False, "no slot found", soft=True)
+            continue
+
+        pct = guesses[0]
+        spent += 1
+        v = post(
+            sess, path,
+            {"ajax_request": 1, "action": "verify_human",
+             "user_position": f"{pct:.4f}", "challenge_token": token},
+            pause=False,
+        )
+        log.info("captcha round %d/%d guess %d/%d: pct=%.2f -> %s",
+                 rnd, CAPTCHA_ROUNDS, spent, CAPTCHA_GUESSES, pct,
+                 json.dumps(v, ensure_ascii=False)[:160])
+
+        if isinstance(v, dict) and v.get("success"):
+            cyc.add("captcha", "verify_human", True,
+                    f"position {pct:.2f}% ({spent} guess{'' if spent == 1 else 'es'} used)")
+            return True, spent
+        if isinstance(v, dict) and v.get("locked"):
+            wait = _unlock_seconds(v)
+            cyc.add("captcha", "verify_human", False, f"locked for {wait - 5}s: {msg(v)}", soft=True)
+            time.sleep(wait)
+            continue
+        # miss — throw this puzzle away, a fresh one is generated next round
+        time.sleep(0.3)
+
+    cyc.add("captcha", "verify_human", False,
+            f"{CAPTCHA_ROUNDS} puzzles, {spent}/{CAPTCHA_GUESSES} guesses — giving up", soft=True)
+    return False, spent
+
+
+# --------------------------------------------------------------------------- math
+
+def _ocr_png(path: str) -> str:
+    """Read a question PNG. tesseract 5 gets the raw file right; a negated and
+    thresholded pass is the fallback when the digits do not come through."""
+    wl = "0123456789+-*=xX. "
+
+    def run(img: str) -> str:
+        try:
+            r = subprocess.run(
+                ["tesseract", img, "stdout", "-l", "eng", "--psm", "7",
+                 "-c", f"tessedit_char_whitelist={wl}"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"tesseract failed: {exc}") from exc
+        return " ".join((r.stdout or "").split())
+
+    text = run(path)
+    if len(re.findall(r"\d+", text)) >= 2:
+        return text
+    fixed = path + ".fix.png"
+    try:
+        magick = shutil.which("magick") or shutil.which("convert")
+        if not magick:
+            return text
+        subprocess.run(
+            [magick, path, "-negate", "-threshold", "60%", "-resize", "300%", fixed],
+            capture_output=True, timeout=60, check=True,
+        )
+        better = run(fixed)
+        return better if len(re.findall(r"\d+", better)) >= 2 else text
+    except (OSError, subprocess.SubprocessError):
+        return text
+    finally:
+        if os.path.exists(fixed):
+            try:
+                os.remove(fixed)
+            except OSError:
+                pass
+
+
+def _pick_math_op(text: str, tipi: str) -> str:
+    """The server's islem_tipi wins; OCR symbols are only a fallback."""
+    if tipi in MATH_OPS:
+        return MATH_OPS[tipi]
+    if "+" in text:
+        return "+"
+    if "-" in text:
+        return "-"
+    if "*" in text or "x" in text or "X" in text:
+        return "*"
+    if "/" in text:
+        return "/"
+    return "+"
+
+
+def _apply_op(a: int, b: int, op: str) -> Optional[int]:
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op == "*":
+        return a * b
+    if op == "/":
+        return a // b if b else None
+    return None
+
+
+def section_math(sess, cyc: Cycle, inspect: bool) -> None:
+    """Solve every question the server will hand out, then empty the vault.
+
+    get_question -> PNG -> tesseract -> check_answer, at >= MATH_MIN_MS apart.
+    Stops on an unreadable question rather than guessing, on
+    verification_required (the slider captcha), or when kalan_islem hits 0.
+    """
+    if DRY_RUN:
+        cyc.add("math", "solve", True, "skipped (dry-run)")
+        return
+    if not MATH_ON:
+        cyc.add("math", "solve", True, "skipped (TICARISK_MATH=0)")
+        return
+    if not shutil.which("tesseract"):
+        cyc.add("math", "solve", True, "skipped (tesseract is not installed)")
+        return
+
+    right = wrong = 0
+    kalan: Optional[int] = None
+    kasa: Optional[str] = None
+    reason = ""
+    gates = 0
+    workdir = tempfile.mkdtemp(prefix="ticarisk_math_")
+    qpath = os.path.join(workdir, "q.png")
+    try:
+        for n in range(1, MATH_MAX + 1):
+            q = post(
+                sess,
+                "/matematik.php",
+                {"ajax_request": 1, "action": "get_question", "islem_tipi": "toplama"},
+                pause=False,
+            )
+            # The anti-bot timer starts when the server issues the question, so
+            # measure from here — not from before get_question — or the answer
+            # lands early and trips verification_required.
+            issued = time.time()
+            if not (isinstance(q, dict) and q.get("success")):
+                reason = msg(q) or "no question available"
+                break
+            rel = str(q.get("question_image_url") or "")
+            if not rel:
+                reason = "question response had no image"
+                break
+
+            img = sess.get(
+                urljoin(BASE + "/matematik.php", rel), timeout=REQUEST_TIMEOUT, verify=False
+            )
+            img.raise_for_status()
+            with open(qpath, "wb") as fh:
+                fh.write(img.content)
+            if inspect and n <= 3:
+                dump(f"inspect/math_q{n}.png", img.content)
+
+            text = _ocr_png(qpath)
+            nums = [int(x) for x in re.findall(r"\d+", text)]
+            if len(nums) < 2:
+                reason = f"could not read question: {text!r}"
+                break
+            op = _pick_math_op(text, str(q.get("islem_tipi") or ""))
+            ans = _apply_op(nums[0], nums[1], op)
+            if ans is None:
+                reason = f"unhandled operator in {text!r}"
+                break
+
+            # OCR and the image download already ate part of the window — top it up
+            wait = MATH_MIN_MS / 1000.0 + 0.1 - (time.time() - issued)
+            if wait > 0:
+                time.sleep(wait)
+
+            a = post(
+                sess,
+                "/matematik.php",
+                {
+                    "ajax_request": 1,
+                    "action": "check_answer",
+                    "cevap": str(ans),
+                    "token": str(q.get("token") or ""),
+                },
+                pause=False,
+            )
+            if not isinstance(a, dict):
+                reason = "check_answer returned non-JSON"
+                break
+            if a.get("verification_required"):
+                gates += 1
+                if gates > CAPTCHA_MAX_GATES:
+                    reason = f"gate appeared {gates} times — stopping"
+                    break
+                log.info("math: verification required — solving the slider puzzle")
+                solved, _spent = solve_puzzle(sess, "/matematik.php", cyc)
+                if not solved:
+                    reason = "verification required and the slider was not solved"
+                    break
+                continue
+            if "dogru" not in a:
+                # refusal with no verdict — "Hourly round limit reached!", a
+                # stale token, anything else. Stop instead of spinning.
+                reason = msg(a) or "check_answer returned no verdict"
+                break
+            if a.get("dogru"):
+                right += 1
+            else:
+                wrong += 1
+            if a.get("kalan_islem") is not None:
+                try:
+                    kalan = int(a["kalan_islem"])
+                except (TypeError, ValueError):
+                    pass
+            if a.get("matematik_kasa") is not None:
+                kasa = str(a["matematik_kasa"])
+            if kalan is not None and kalan <= 0:
+                break
+            if n % 25 == 0:
+                log.info("math: %d solved, %s left, vault $%s", right, kalan, kasa)
+    except Exception as exc:  # noqa: BLE001 - reported as a step, never fatal
+        reason = f"aborted: {exc}"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    done = right + wrong
+    detail = f"{right}/{done} correct"
+    if kalan is not None:
+        detail += f", {kalan} questions left"
+    if kasa is not None:
+        detail += f", vault ${kasa}"
+    if reason:
+        detail += f" — {reason}"
+
+    if done == 0:
+        benign = bool(BENIGN_RE.search(reason or ""))
+        cyc.add("math", "solve", benign, detail, soft=not benign)
+    elif wrong == 0:
+        cyc.add("math", f"solve {right}/{done}", True, detail)
+    else:
+        cyc.add("math", f"solve {right}/{done}", False, detail, soft=(right >= wrong))
+
+    if MATH_WITHDRAW and done:
+        w = post(sess, "/matematik.php", {"ajax_request": 1, "action": "hesaba_cek"}, pause=False)
+        cyc.add("math", "withdraw vault", ok(w), msg(w), soft=not ok(w))
+
+
+# --------------------------------------------------------------------------- main
+
+
+def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
+    global DRY_RUN
+    DRY_RUN = dry_run
+    cyc = Cycle()
+    sess = login()
+
+    if dry_run:
+        log.warning("DRY RUN — no mutating request will be sent")
+
+    if "production" in sections:
+        section_production(sess, cyc, inspect)
+    if "fields" in sections:
+        section_fields(sess, cyc, inspect)
+    if "orchards" in sections:
+        section_orchards(sess, cyc, inspect)
+    if "barns" in sections:
+        _animals(sess, cyc, inspect, "barns", "ahirlar", "ahir")
+    if "coops" in sections:
+        _animals(sess, cyc, inspect, "coops", "kumesler", "kumes")
+    if "bees" in sections:
+        section_bees(sess, cyc, inspect)
+    if "math" in sections:
+        section_math(sess, cyc, inspect)
+
+    bal = balance(sess)
+    if bal is not None:
+        cyc.add("account", "balance", True, f"${bal:,.2f}")
+    return cyc
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Ticarisk production + farm automation")
+    ap.add_argument(
+        "--sections",
+        default=os.environ.get("TICARISK_SECTIONS", DEFAULT_SECTIONS),
+        help="comma separated: " + DEFAULT_SECTIONS,
+    )
+    ap.add_argument("--inspect", action="store_true", help="dump pages to inspect/")
+    ap.add_argument("--dry-run", action="store_true", help="report only, change nothing")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("ticarisk-cycle.log", encoding="utf-8"),
+        ],
+    )
+    urllib3.disable_warnings()
+
+    sections = [s.strip().lower() for s in args.sections.split(",") if s.strip()]
+    unknown = set(sections) - set(DEFAULT_SECTIONS.split(","))
+    if unknown:
+        log.warning("ignoring unknown sections: %s", ", ".join(sorted(unknown)))
+
+    try:
+        cyc = run_cycle(sections, args.inspect, args.dry_run)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        log.exception("cycle aborted: %s", exc)
+        return 2
+
+    print("\n" + "=" * 68)
+    for s in cyc.steps:
+        print(s.line())
+    print("=" * 68)
+    ok_count = len(cyc.steps) - len(cyc.failed) - len(cyc.warned)
+    tail = f"  ({len(cyc.warned)} warnings)" if cyc.warned else ""
+    print(f"{ok_count}/{len(cyc.steps)} steps ok{tail}")
+
+    return 1 if cyc.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

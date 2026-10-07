@@ -1,0 +1,114 @@
+name: ticarisk-cycle
+
+# Cron is UTC. The game runs on Europe/Istanbul (TRT, UTC+3, no DST), so the
+# times below are expressed both ways — keep them in sync if you edit either.
+#
+# BUDGET: everything runs hourly because the math pool is strictly per-hour —
+# check_answer answers "Hourly round limit reached! Try again next hour." and
+# the pool does NOT accumulate, so an hour the bot misses is lost forever.
+#
+#   PUBLIC repo  -> Actions minutes are unlimited. This schedule is free.
+#   PRIVATE repo -> 2,000 min/month (3,000 with the Student Pack). One hourly
+#                   full run bills ~12 min x 720 ≈ 8,600 min, which does NOT
+#                   fit. On a private repo, drop "math" from the hourly cron
+#                   below (or run math on your own machine) and the farm alone
+#                   is ~460 min/month.
+on:
+  schedule:
+    # HOURLY, everything: farm (~15 s) + math, which clears that hour's ~300
+    # questions in ~11 min. :11 UTC == :11 TRT — offset off :00 so we don't
+    # queue behind GitHub's stampede on the hour; the run finishes at :22,
+    # well inside the hour it is draining.
+    - cron: "11 * * * *"
+    # 21:05 UTC == 00:05 TRT — right after the daily limits reset (forex
+    # $200,000,000/day, raw-material water 25,000 L/day)
+    - cron: "5 21 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report only, change nothing"
+        type: boolean
+        default: false
+      sections:
+        description: "Comma separated sections to run"
+        default: "production,fields,orchards,barns,coops,bees,math"
+
+permissions:
+  contents: read
+
+# one cycle at a time — overlapping runs would double-POST every action
+concurrency:
+  group: ticarisk-cycle
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      # only needed for the math section (question images are PNGs)
+      - name: Install OCR
+        run: |
+          if ! command -v tesseract >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq tesseract-ocr
+          fi
+          tesseract --version | head -1
+
+      - name: Pick sections
+        id: pick
+        env:
+          INPUTS: ${{ inputs.sections }}
+        run: |
+          SECTIONS="${INPUTS:-production,fields,orchards,barns,coops,bees,math}"
+          echo "sections=$SECTIONS" >> "$GITHUB_OUTPUT"
+          echo "running sections: $SECTIONS"
+
+      - name: Run cycle
+        env:
+          TICARISK_USER: ${{ secrets.TICARISK_USER }}
+          TICARISK_PASS: ${{ secrets.TICARISK_PASS }}
+          TICARISK_SECTIONS: ${{ steps.pick.outputs.sections }}
+          TICARISK_CROP_ID: ${{ vars.TICARISK_CROP_ID || '4' }}
+          TICARISK_CROP_ROTATION: ${{ vars.TICARISK_CROP_ROTATION || '1' }}
+          TICARISK_ROTATION_FILE: ${{ vars.TICARISK_ROTATION_FILE || 'crop_rotation.json' }}
+          # fields replant only after a harvest; 150 L x $120 = $18,000, and
+          # MAX_WATER_SPEND hard-caps it so a bad loop can't drain the balance
+          TICARISK_BUY_WATER_LITERS: ${{ vars.TICARISK_BUY_WATER_LITERS || '150' }}
+          TICARISK_MAX_WATER_SPEND: ${{ vars.TICARISK_MAX_WATER_SPEND || '20000' }}
+          # feed top-ups: material_id:trigger:usd_cap
+          TICARISK_RESTOCK: ${{ vars.TICARISK_RESTOCK || 'besi_yemi:500:40000,kumes_yemi:2000:20000,besi_suyu:2000:15000' }}
+          TICARISK_MAX_RESTOCK_SPEND: ${{ vars.TICARISK_MAX_RESTOCK_SPEND || '100000' }}
+          TICARISK_FEED_ANIMALS: ${{ vars.TICARISK_FEED_ANIMALS || '1' }}
+          TICARISK_PETEK_REFILL: ${{ vars.TICARISK_PETEK_REFILL || '1' }}
+          TICARISK_PETEK_MAX_SPEND: ${{ vars.TICARISK_PETEK_MAX_SPEND || '60000' }}
+          TICARISK_MATH: ${{ vars.TICARISK_MATH || '1' }}
+          TICARISK_MATH_MAX: ${{ vars.TICARISK_MATH_MAX || '400' }}
+          TICARISK_MATH_WITHDRAW: ${{ vars.TICARISK_MATH_WITHDRAW || '1' }}
+          TICARISK_MATH_MIN_MS: ${{ vars.TICARISK_MATH_MIN_MS || '1500' }}
+          # the math section sets its own pacing, so only the farm needs the
+          # slow inter-request pause
+          TICARISK_PAUSE: "1.2"
+          EXTRA_FLAG: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: python bot.py --inspect $EXTRA_FLAG
+
+      - name: Upload logs and page dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticarisk-cycle-${{ github.run_number }}
+          path: |
+            ticarisk-cycle.log
+            inspect/
+          if-no-files-found: ignore
+          retention-days: 14
