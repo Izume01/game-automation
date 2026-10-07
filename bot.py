@@ -104,9 +104,12 @@ MAX_WATER_SPEND = float(os.environ.get("TICARISK_MAX_WATER_SPEND", "0"))  # 0 = 
 # Cement/Cyanide/Acid/Silicon are NOT on the market; they come from factories.
 RESTOCK_SPEC = os.environ.get(
     "TICARISK_RESTOCK",
-    "besi_yemi:500:40000,kumes_yemi:2000:20000,besi_suyu:2000:15000",
+    "besi_yemi:800:150000,kumes_yemi:4000:120000,besi_suyu:2000:150000",
 )
-MAX_RESTOCK_SPEND = float(os.environ.get("TICARISK_MAX_RESTOCK_SPEND", "100000"))
+MAX_RESTOCK_SPEND = float(os.environ.get("TICARISK_MAX_RESTOCK_SPEND", "400000"))
+# water is billed separately: 7 fields x 6 cycles x $18,000 would blow past any
+# per-purchase cap, so the whole day gets one number too
+MAX_WATER_DAY = float(os.environ.get("TICARISK_MAX_WATER_DAY", "1000000"))
 RESTOCK_LEDGER = os.environ.get("TICARISK_RESTOCK_LEDGER", "restock_spend.json")
 
 def _parse_restock(raw: str) -> List[Tuple[str, int, float]]:
@@ -689,16 +692,21 @@ def _ledger() -> dict:
         d = {}
     if d.get("day") != _today():
         d = {"day": _today(), "spend": 0.0}
-    try:
-        d["spend"] = float(d.get("spend", 0.0))
-    except (TypeError, ValueError):
-        d["spend"] = 0.0
+    # "spend" is the legacy total; categories ride alongside it so an old
+    # ledger file still loads
+    for k in ("spend", "restock", "water"):
+        try:
+            d[k] = float(d.get(k, 0.0))
+        except (TypeError, ValueError):
+            d[k] = 0.0
+    if d.get("restock", 0.0) == 0.0 and d.get("spend", 0.0):
+        d["restock"] = d["spend"]
     return d
 
 
-def _ledger_add(amount: float) -> float:
+def _ledger_add(amount: float, key: str = "restock") -> float:
     d = _ledger()
-    d["spend"] += amount
+    d[key] = d.get(key, 0.0) + amount
     try:
         with open(RESTOCK_LEDGER, "w") as fh:
             json.dump(d, fh)
@@ -715,6 +723,7 @@ def _buy_material(
     want: int,
     max_spend: float,
     html: Optional[str] = None,
+    ledger_key: str = "restock",
 ) -> bool:
     """Buy `want` units of a raw material.
 
@@ -764,7 +773,7 @@ def _buy_material(
     good = ok(res)
     cyc.add(step, f"buy {qty} {L['unit']} {L['name']}", good, msg(res))
     if good:
-        _ledger_add(qty * price)
+        _ledger_add(qty * price, ledger_key)
     return good
 
 
@@ -772,7 +781,20 @@ def _maybe_buy_water(sess, cyc: Cycle) -> bool:
     if BUY_WATER_LITERS <= 0:
         cyc.add("fields", "buy water", True, "skipped (TICARISK_BUY_WATER_LITERS=0)")
         return False
-    return _buy_material(sess, cyc, "fields", "su", BUY_WATER_LITERS, MAX_WATER_SPEND)
+    spent = _ledger().get("water", 0.0)
+    if MAX_WATER_DAY > 0 and spent >= MAX_WATER_DAY:
+        cyc.add(
+            "fields",
+            "buy water",
+            True,
+            f"daily water cap reached — ${spent:,.0f} of ${MAX_WATER_DAY:,.0f}",
+        )
+        return False
+    return _buy_material(
+        sess, cyc, "fields", "su", BUY_WATER_LITERS,
+        min(MAX_WATER_SPEND, MAX_WATER_DAY - spent) if MAX_WATER_DAY > 0 else MAX_WATER_SPEND,
+        ledger_key="water",
+    )
 
 
 def _restock(sess, cyc: Cycle) -> None:
@@ -786,7 +808,7 @@ def _restock(sess, cyc: Cycle) -> None:
         cyc.add("production", "restock", True, "disabled (TICARISK_RESTOCK is empty)")
         return
 
-    spent = _ledger()["spend"]
+    spent = _ledger().get("restock", 0.0)
     if MAX_RESTOCK_SPEND > 0 and spent >= MAX_RESTOCK_SPEND:
         cyc.add(
             "production",
@@ -815,9 +837,10 @@ def _restock(sess, cyc: Cycle) -> None:
         if L["stock"] >= trigger:
             healthy.append(f"{L['name']} {L['stock']}")
             continue
-        if _buy_material(sess, cyc, "restock", mid, trigger, min(cap, budget), html=html):
+        if _buy_material(sess, cyc, "restock", mid, trigger, min(cap, budget),
+                         html=html, ledger_key="restock"):
             bought += 1
-            spent = _ledger()["spend"]
+            spent = _ledger().get("restock", 0.0)
         else:
             short.append(f"{L['name']} {L['stock']}<{trigger}")
 

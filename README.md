@@ -108,21 +108,28 @@ only when stock is under its trigger.
 
 | what | when | cap |
 |---|---|---|
-| **water** | only when a field says `Not enough water!` | `TICARISK_MAX_WATER_SPEND` (default **$20,000**) |
-| **feed top-up** | only when stock < trigger | per-material cap + `TICARISK_MAX_RESTOCK_SPEND` (**$100,000/day**) |
+| **water** | only when a field says `Not enough water!` | `TICARISK_MAX_WATER_SPEND` per buy (**$20,000**) **and** `TICARISK_MAX_WATER_DAY` per day (**$1,000,000**) |
+| **feed top-up** | only when stock < trigger | per-material cap + `TICARISK_MAX_RESTOCK_SPEND` (**$400,000/day**) |
 | **honeycomb** | only when the page reports combs below max | `TICARISK_PETEK_MAX_SPEND` (**$60,000**) |
 | animal feed action | — | free (uses stock) |
 
+Triggers are sized against measured burn, not guesswork — the account burns
+**6,000 kg of poultry feed and ~1,000 kg of fattening feed a day**, so the
+default trigger sits at roughly half a day's buffer rather than a token amount.
+
 ```bash
-# default: buys fattening feed under 500 kg (≤$40k), poultry feed under
-# 2,000 kg (≤$20k), livestock water under 2,000 L (≤$15k)
-TICARISK_RESTOCK="besi_yemi:500:40000,kumes_yemi:2000:20000,besi_suyu:2000:15000"
-TICARISK_MAX_RESTOCK_SPEND=100000     # per day, tracked in restock_spend.json
+# default: restock each material up to `trigger` when stock falls under it,
+# never more than the third field in one purchase
+TICARISK_RESTOCK="besi_yemi:800:150000,kumes_yemi:4000:120000,besi_suyu:2000:150000"
+TICARISK_MAX_RESTOCK_SPEND=400000     # per day, feed only
 TICARISK_BUY_WATER_LITERS=150         # 0 disables water buying entirely
-TICARISK_MAX_WATER_SPEND=20000
+TICARISK_MAX_WATER_SPEND=20000        # per purchase
+TICARISK_MAX_WATER_DAY=1000000        # per day, 7 fields x 6 cycles ≈ $756k
 ```
 
-`restock_spend.json` is the daily ledger; it resets on date change.
+`restock_spend.json` is the daily ledger — `restock` and `water` are tracked in
+separate buckets and reset on date change. Expected real spend: feed ~$300k/day,
+water ~$756k/day **only after fields start replanting** (they have not yet).
 
 **Not buyable.** Cement, Cyanide, Acid, Marble and Silicon are absent from
 `hammaddeler.php` — they are factory output. A mine stuck on
