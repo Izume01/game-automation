@@ -1603,17 +1603,20 @@ def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
 
 
 def _clean_image(path: str) -> Optional[str]:
-    """Replicate the userscript's cleanImage(), byte for byte in behaviour.
+    """Replicate the userscript's cleanImage(), smoothly upscaling and binarizing."""
+    magick = shutil.which("magick") or shutil.which("convert")
+    if magick:
+        dest = path + ".clean.png"
+        try:
+            subprocess.run(
+                [magick, path, "-resize", "200%", "-threshold", "37%", "-negate",
+                 "-bordercolor", "white", "-border", "16", dest],
+                capture_output=True, timeout=30, check=True,
+            )
+            return dest
+        except (OSError, subprocess.SubprocessError):
+            pass
 
-      1. upscale 2x
-      2. binarize: mean RGB > 95 -> foreground
-      3. despeckle: drop a foreground pixel with fewer than 2 of 8 neighbours
-
-    Without this the text arrives anti-aliased over a gradient and tesseract
-    occasionally splits a two-digit number ("5 + 66" -> "5 + 6 6"), which the
-    parser then reads as a real three-token expression. Written as PGM because
-    tesseract takes it directly and it needs no encoder.
-    """
     try:
         with open(path, "rb") as fh:
             data = fh.read()
@@ -1647,10 +1650,9 @@ def _clean_image(path: str) -> Optional[str]:
 def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
     """OCR a question image, trusting only a reading the passes agree on.
 
-    Returns (a, b, text). None when no pass produced a clean two-number
-    reading — the caller stops rather than answering from a guess.
+    Returns (a, b, text).
     """
-    wl = "0123456789+-*=xX. "
+    wl = "0123456789+-*x "
     raw: List[str] = []
 
     def run(args: List[str]) -> None:
@@ -1666,12 +1668,10 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
     src = clean or path
     base = ["tesseract", src, "stdout", "-l", "eng",
             "-c", f"tessedit_char_whitelist={wl}"]
-    # cleaned image first — that is what the proven script feeds its OCR
-    for psm in ("7", "8", "6"):
+    for psm in ("6", "7"):
         run(base + ["--psm", psm])
-    # raw image as a tie-breaker: when both agree the reading is certain
     if clean:
-        for psm in ("7", "8"):
+        for psm in ("6", "7"):
             run(["tesseract", path, "stdout", "-l", "eng", "--psm", psm,
                  "-c", f"tessedit_char_whitelist={wl}"])
 
