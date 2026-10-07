@@ -1681,12 +1681,8 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
     src = clean or path
     base = ["tesseract", src, "stdout", "-l", "eng",
             "-c", f"tessedit_char_whitelist={wl}"]
-    for psm in ("6", "7"):
+    for psm in ("6", "7", "3"):
         run(base + ["--psm", psm])
-    if clean:
-        for psm in ("6", "7"):
-            run(["tesseract", path, "stdout", "-l", "eng", "--psm", psm,
-                 "-c", f"tessedit_char_whitelist={wl}"])
 
     for junk in (clean, clean and clean.replace(".clean.pgm", ".clean.pgm")):
         if junk and os.path.exists(junk):
