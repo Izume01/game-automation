@@ -108,7 +108,7 @@ only when stock is under its trigger.
 
 | what | when | cap |
 |---|---|---|
-| **water** | only when a field says `Not enough water!` | `TICARISK_MAX_WATER_SPEND` per buy (**$20,000**) **and** `TICARISK_MAX_WATER_DAY` per day (**$1,000,000**) |
+| **water** | tank drops under `TICARISK_WATER_TRIGGER` (1,000 L), or a field says `Not enough water!` | `TICARISK_MAX_WATER_SPEND` per buy (**$20,000**) **and** `TICARISK_MAX_WATER_DAY` per day (**$1,000,000**) |
 | **feed top-up** | only when stock < trigger | per-material cap + `TICARISK_MAX_RESTOCK_SPEND` (**$400,000/day**) |
 | **honeycomb** | only when the page reports combs below max | `TICARISK_PETEK_MAX_SPEND` (**$60,000**) |
 | animal feed action | — | free (uses stock) |

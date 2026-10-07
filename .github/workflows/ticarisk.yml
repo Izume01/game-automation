@@ -98,6 +98,7 @@ jobs:
           TICARISK_BUY_WATER_LITERS: ${{ vars.TICARISK_BUY_WATER_LITERS || '150' }}
           TICARISK_MAX_WATER_SPEND: ${{ vars.TICARISK_MAX_WATER_SPEND || '20000' }}
           TICARISK_MAX_WATER_DAY: ${{ vars.TICARISK_MAX_WATER_DAY || '1000000' }}
+          TICARISK_WATER_TRIGGER: ${{ vars.TICARISK_WATER_TRIGGER || '1000' }}
           # feed top-ups: material_id:trigger:usd_cap
           TICARISK_RESTOCK: ${{ vars.TICARISK_RESTOCK || 'besi_yemi:800:150000,kumes_yemi:4000:120000,besi_suyu:2000:150000' }}
           TICARISK_MAX_RESTOCK_SPEND: ${{ vars.TICARISK_MAX_RESTOCK_SPEND || '400000' }}

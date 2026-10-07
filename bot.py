@@ -110,6 +110,11 @@ MAX_RESTOCK_SPEND = float(os.environ.get("TICARISK_MAX_RESTOCK_SPEND", "400000")
 # water is billed separately: 7 fields x 6 cycles x $18,000 would blow past any
 # per-purchase cap, so the whole day gets one number too
 MAX_WATER_DAY = float(os.environ.get("TICARISK_MAX_WATER_DAY", "1000000"))
+# Water is the root of the whole production chain — the chemical plant needs
+# 200 L a cycle to make the Cyanide/Acid that unblocks the gold mine, and the
+# concrete plant needs 62 L. Top the tank up on its own schedule, not only
+# when a field happens to fail.
+WATER_TRIGGER = int(os.environ.get("TICARISK_WATER_TRIGGER", "1000"))
 RESTOCK_LEDGER = os.environ.get("TICARISK_RESTOCK_LEDGER", "restock_spend.json")
 
 def _parse_restock(raw: str) -> List[Tuple[str, int, float]]:
@@ -564,6 +569,7 @@ def section_production(sess, cyc: Cycle, inspect: bool) -> None:
                 soft=(not good) and SOFT_RE.search(str(msg(r2))) is not None,
             )
 
+    _top_up_water(sess, cyc)
     _restock(sess, cyc)
 
 
@@ -795,6 +801,37 @@ def _maybe_buy_water(sess, cyc: Cycle) -> bool:
         min(MAX_WATER_SPEND, MAX_WATER_DAY - spent) if MAX_WATER_DAY > 0 else MAX_WATER_SPEND,
         ledger_key="water",
     )
+
+
+def _top_up_water(sess, cyc: Cycle) -> None:
+    """Keep the water tank above WATER_TRIGGER.
+
+    Field planting used to be the only thing that ever bought water, which
+    meant the factories could starve while the fields were still growing.
+    """
+    if WATER_TRIGGER <= 0:
+        cyc.add("production", "water", True, "disabled (TICARISK_WATER_TRIGGER=0)")
+        return
+    spent = _ledger().get("water", 0.0)
+    if MAX_WATER_DAY > 0 and spent >= MAX_WATER_DAY:
+        cyc.add("production", "water", True,
+                f"daily water cap reached — ${spent:,.0f} of ${MAX_WATER_DAY:,.0f}")
+        return
+    try:
+        L = _listing(_market_html(sess), "su")
+    except Exception as exc:
+        cyc.add("production", "water", False, str(exc))
+        return
+    if not L:
+        cyc.add("production", "water", False, "water listing not found")
+        return
+    if L["stock"] >= WATER_TRIGGER:
+        cyc.add("production", "water", True, f"{L['stock']} L in stock (trigger {WATER_TRIGGER})")
+        return
+    budget = MAX_WATER_SPEND
+    if MAX_WATER_DAY > 0:
+        budget = min(budget, MAX_WATER_DAY - spent) if MAX_WATER_SPEND > 0 else MAX_WATER_DAY - spent
+    _buy_material(sess, cyc, "production", "su", WATER_TRIGGER, budget, ledger_key="water")
 
 
 def _restock(sess, cyc: Cycle) -> None:
