@@ -65,9 +65,13 @@ jobs:
           command -v tesseract >/dev/null 2>&1 || pkgs="$pkgs tesseract-ocr"
           command -v convert    >/dev/null 2>&1 || pkgs="$pkgs imagemagick"
           if [ -n "$pkgs" ]; then
-            sudo apt-get update -qq
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            echo "installing:$pkgs"
+            sudo apt-get update -qq -o Acquire::Retries=3
+            # no -qq on install: the progress lines are what tell you it is alive
+            timeout 300 sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
               --no-install-recommends $pkgs
+          else
+            echo "both tools already present"
           fi
           tesseract --version | head -1
           convert -version | head -1
