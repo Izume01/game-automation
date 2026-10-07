@@ -1633,6 +1633,7 @@ def _clean_image(path: str) -> Optional[str]:
 
     out = np.where(keep, 0, 255).astype(np.uint8)
     out = np.repeat(np.repeat(out, 2, 0), 2, 1)  # scale = 2
+    out = np.pad(out, 16, mode="constant", constant_values=255)  # white border prevents edge digit clipping
     dest = path + ".clean.pgm"
     try:
         with open(dest, "wb") as fh:
