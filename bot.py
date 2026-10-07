@@ -1613,15 +1613,15 @@ def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
 def _clean_image(path: str) -> Optional[str]:
     """Replicate the userscript's cleanImage(), smoothly upscaling and binarizing."""
     magick = shutil.which("magick") or shutil.which("convert")
-    scaled_2x = path + ".2x.png"
+    scaled_3x = path + ".3x.png"
     src_path = path
     if magick:
         try:
             subprocess.run(
-                [magick, path, "-resize", "200%", scaled_2x],
+                [magick, path, "-resize", "300%", scaled_3x],
                 capture_output=True, timeout=30, check=True,
             )
-            src_path = scaled_2x
+            src_path = scaled_3x
         except (OSError, subprocess.SubprocessError):
             src_path = path
 
@@ -1638,6 +1638,11 @@ def _clean_image(path: str) -> Optional[str]:
             except OSError:
                 pass
 
+    # Discard top/bottom noise stars: question text is strictly in the central band
+    if arr.shape[0] >= 100:
+        h_arr = arr.shape[0]
+        arr = arr[int(h_arr * 0.25):int(h_arr * 0.75), :]
+
     fg = arr.mean(2) > 95
     n = np.zeros(fg.shape, dtype=np.int16)
     for dy in (-1, 0, 1):
@@ -1649,7 +1654,7 @@ def _clean_image(path: str) -> Optional[str]:
     keep[1:-1, 1:-1] = fg[1:-1, 1:-1] & (n[1:-1, 1:-1] >= 2)
 
     out = np.where(keep, 0, 255).astype(np.uint8)
-    out = np.pad(out, 16, mode="constant", constant_values=255)
+    out = np.pad(out, 24, mode="constant", constant_values=255)
     dest = path + ".clean.pgm"
     try:
         with open(dest, "wb") as fh:
