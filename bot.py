@@ -1034,10 +1034,119 @@ def action_forms(src: str) -> List[Tuple[str, str, str]]:
 # `user_position` it wants is a PERCENT of the background width, not pixels.
 
 
-def _im_load(data: bytes):
-    """Decode an image to a float HxWx3 array using ImageMagick (no PIL here)."""
+def _png_load(data: bytes):
+    """Pure-Python PNG decode -> (float HxWx3 0..255, w, h).
+
+    Second line of defence only. The captcha currently ships JPEG for both the
+    background and the piece, so ImageMagick is required in practice — this
+    exists for the day the puzzle is served as PNG, and for any other PNG a
+    caller wants decoded without shelling out.
+    """
     if np is None:
         raise RuntimeError("numpy is required for captcha solving")
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise RuntimeError("not a PNG")
+    pos, idat, trns = 8, [], None
+    w = h = depth = ctype = interlace = 0
+    plte = b""
+    while pos + 8 <= len(data):
+        ln = int.from_bytes(data[pos : pos + 4], "big")
+        tag = data[pos + 4 : pos + 8]
+        body = data[pos + 8 : pos + 8 + ln]
+        pos += 12 + ln
+        if tag == b"IHDR":
+            w, h, depth, ctype, _c, _f, interlace = (
+                int.from_bytes(body[0:4], "big"),
+                int.from_bytes(body[4:8], "big"),
+                body[8], body[9], body[10], body[11], body[12],
+            )
+        elif tag == b"PLTE":
+            plte = bytes(body)
+        elif tag == b"tRNS":
+            trns = bytes(body)
+        elif tag == b"IDAT":
+            idat.append(bytes(body))
+        elif tag == b"IEND":
+            break
+    if depth != 8 or interlace != 0 or not idat:
+        raise RuntimeError(f"unsupported PNG (depth={depth}, interlace={interlace})")
+    ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(ctype)
+    if ch is None:
+        raise RuntimeError(f"unsupported PNG colour type {ctype}")
+
+    import zlib
+
+    raw = zlib.decompress(b"".join(idat))
+    stride, bpp = w * ch, ch
+    if len(raw) < h * (stride + 1):
+        raise RuntimeError("short PNG data")
+
+    out = bytearray()
+    prev = bytearray(stride)
+    i = 0
+    for _ in range(h):
+        f = raw[i]
+        i += 1
+        line = bytearray(raw[i : i + stride])
+        i += stride
+        if f == 1:
+            for j in range(stride):
+                line[j] = (line[j] + (line[j - bpp] if j >= bpp else 0)) & 0xFF
+        elif f == 2:
+            for j in range(stride):
+                line[j] = (line[j] + prev[j]) & 0xFF
+        elif f == 3:
+            for j in range(stride):
+                left = line[j - bpp] if j >= bpp else 0
+                line[j] = (line[j] + ((left + prev[j]) >> 1)) & 0xFF
+        elif f == 4:
+            for j in range(stride):
+                a = line[j - bpp] if j >= bpp else 0
+                b = prev[j]
+                c = prev[j - bpp] if j >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[j] = (
+                    line[j] + (a if (pa <= pb and pa <= pc) else b if pb <= pc else c)
+                ) & 0xFF
+        elif f != 0:
+            raise RuntimeError(f"bad PNG filter type {f}")
+        out += line
+        prev = line
+
+    px = np.frombuffer(bytes(out), dtype=np.uint8).reshape(h, w, ch)
+    if ctype == 3:
+        if not plte:
+            raise RuntimeError("palette PNG without PLTE")
+        idx = px[:, :, 0]
+        rgb = np.frombuffer(plte, dtype=np.uint8).reshape(-1, 3)[idx]
+    elif ctype == 0:
+        rgb = np.repeat(px, 3, axis=2)
+    elif ctype == 4:
+        g = px[:, :, :1]
+        rgb = np.repeat(g, 3, axis=2)
+    else:
+        rgb = px[:, :, :3]
+    return rgb.astype(float), w, h
+
+
+def _im_load(data: bytes):
+    """Decode an image to a float HxWx3 array.
+
+    ImageMagick when it is installed, pure-Python PNG otherwise — the puzzle
+    only ever serves PNGs, so a runner missing IM still solves captchas.
+    """
+    if np is None:
+        raise RuntimeError("numpy is required for captcha solving")
+    if not (shutil.which("identify") and shutil.which("convert")):
+        try:
+            return _png_load(data)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "ImageMagick is not installed, and this image is not a decodable "
+                f"PNG ({exc}). The captcha ships JPEG for both the background and "
+                "the piece — imagemagick is required."
+            ) from exc
     fd, path = tempfile.mkstemp(suffix=".img")
     rgb = path + ".rgb"
     try:

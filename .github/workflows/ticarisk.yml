@@ -56,14 +56,21 @@ jobs:
       - name: Install
         run: pip install -r requirements.txt
 
-      # only needed for the math section (question images are PNGs)
+      # tesseract  -> the math section (question images are PNGs)
+      # imagemagick -> the captcha solver: the puzzle background ships as JPEG,
+      #                which nothing on a stock runner can decode.
       - name: Install OCR
         run: |
-          if ! command -v tesseract >/dev/null 2>&1; then
+          pkgs=""
+          command -v tesseract >/dev/null 2>&1 || pkgs="$pkgs tesseract-ocr"
+          command -v convert    >/dev/null 2>&1 || pkgs="$pkgs imagemagick"
+          if [ -n "$pkgs" ]; then
             sudo apt-get update -qq
-            sudo apt-get install -y -qq tesseract-ocr
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+              --no-install-recommends $pkgs
           fi
           tesseract --version | head -1
+          convert -version | head -1
 
       - name: Pick sections
         id: pick
