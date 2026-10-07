@@ -20,10 +20,6 @@ on:
     # queue behind GitHub's stampede on the hour; the run finishes at :22,
     # well inside the hour it is draining.
     - cron: "11 * * * *"
-    # 21:05 UTC == 00:05 TRT — right after the daily limits reset (forex
-    # $200,000,000/day, raw-material water 25,000 L/day)
-    - cron: "5 21 * * *"
-    - cron: "13 21 * * *"  # TEMP scheduler probe
   workflow_dispatch:
     inputs:
       dry_run:
