@@ -1577,51 +1577,66 @@ def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
         return None
     flat = " ".join(text.split()).strip(". ,:;")
 
+    def fix_2digit(n: int) -> int:
+        if n > 99:
+            s = str(n)
+            if len(s) == 3 and s[0] == '4':
+                return int(s[1:])
+            if len(s) == 3 and s[-1] == '4':
+                return int(s[:-1])
+        return n
+
     m = _Q_FULL.match(flat)
     if m:
-        return int(m.group(1)), int(m.group(3))
+        return fix_2digit(int(m.group(1))), fix_2digit(int(m.group(3)))
 
     m = _Q_COMPACT.match(flat.replace(" ", "").strip(". ,:;"))
     if m:
-        return int(m.group(1)), int(m.group(3))
+        return fix_2digit(int(m.group(1))), fix_2digit(int(m.group(3)))
 
     parts = flat.split()
     if len(parts) >= 2 and parts[0].isdigit() and parts[-1].isdigit():
-        return int(parts[0]), int(parts[-1])
+        return fix_2digit(int(parts[0])), fix_2digit(int(parts[-1]))
 
     m = re.search(r"(\d+)\s*([+\-*/xX])\s*(\d+)", flat)
     if m:
-        return int(m.group(1)), int(m.group(3))
+        return fix_2digit(int(m.group(1))), fix_2digit(int(m.group(3)))
 
     nums = [int(n) for n in re.findall(r"\d+", flat)]
     if len(nums) == 2:
-        return nums[0], nums[1]
+        return fix_2digit(nums[0]), fix_2digit(nums[1])
     if len(nums) == 3 and nums[1] in (1, 4):
-        return nums[0], nums[2]
+        return fix_2digit(nums[0]), fix_2digit(nums[2])
     return None
 
 
 def _clean_image(path: str) -> Optional[str]:
     """Replicate the userscript's cleanImage(), smoothly upscaling and binarizing."""
     magick = shutil.which("magick") or shutil.which("convert")
+    scaled_2x = path + ".2x.png"
+    src_path = path
     if magick:
-        dest = path + ".clean.png"
         try:
             subprocess.run(
-                [magick, path, "-resize", "200%", "-threshold", "37%", "-negate",
-                 "-bordercolor", "white", "-border", "16", dest],
+                [magick, path, "-resize", "200%", scaled_2x],
                 capture_output=True, timeout=30, check=True,
             )
-            return dest
+            src_path = scaled_2x
         except (OSError, subprocess.SubprocessError):
-            pass
+            src_path = path
 
     try:
-        with open(path, "rb") as fh:
+        with open(src_path, "rb") as fh:
             data = fh.read()
         arr, _w, _h = _im_load(data)
     except Exception:  # noqa: BLE001
         return None
+    finally:
+        if src_path != path and os.path.exists(src_path):
+            try:
+                os.remove(src_path)
+            except OSError:
+                pass
 
     fg = arr.mean(2) > 95
     n = np.zeros(fg.shape, dtype=np.int16)
@@ -1634,8 +1649,7 @@ def _clean_image(path: str) -> Optional[str]:
     keep[1:-1, 1:-1] = fg[1:-1, 1:-1] & (n[1:-1, 1:-1] >= 2)
 
     out = np.where(keep, 0, 255).astype(np.uint8)
-    out = np.repeat(np.repeat(out, 2, 0), 2, 1)  # scale = 2
-    out = np.pad(out, 16, mode="constant", constant_values=255)  # white border prevents edge digit clipping
+    out = np.pad(out, 16, mode="constant", constant_values=255)
     dest = path + ".clean.pgm"
     try:
         with open(dest, "wb") as fh:
