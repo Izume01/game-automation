@@ -449,7 +449,7 @@ def pick_crop(opts: Dict[int, str], html: str) -> Tuple[int, str, str]:
 
 # A crop the field's level will not accept. Anything else is a different problem.
 LEVEL_BLOCKED_RE = re.compile(
-    r"level|seviye|unlock|locked|not (?:yet )?available|Sv\.\d|require", re.I
+    r"level|seviye|unlock|locked|not (?:yet )?available|Sv\.\d", re.I
 )
 
 
@@ -626,12 +626,16 @@ def section_fields(sess, cyc: Cycle, inspect: bool) -> None:
         )
 
     res = plant(crop)
+    if not ok(res) and "water" in msg(res).lower():
+        if _maybe_buy_water(sess, cyc):
+            res = plant(crop)
+
     cyc.add("fields", f"plant {label} on {len(empty)} ({why})", ok(res), msg(res))
 
     # a crop above this field's Sv level is refused — walk the rotation forward
     # until the server takes one, rather than getting stuck on it every hour
     tried = [crop]
-    while not ok(res) and opts and LEVEL_BLOCKED_RE.search(str(msg(res))):
+    while not ok(res) and opts and "water" not in msg(res).lower() and LEVEL_BLOCKED_RE.search(str(msg(res))):
         nxt = next((c for c in opts if c not in tried), None)
         if nxt is None:
             break
@@ -639,11 +643,6 @@ def section_fields(sess, cyc: Cycle, inspect: bool) -> None:
         crop, label = nxt, opts[nxt]
         res = plant(nxt)
         cyc.add("fields", f"plant {label} (rotation fallback)", ok(res), msg(res))
-
-    if not ok(res) and "water" in msg(res).lower():
-        if _maybe_buy_water(sess, cyc):
-            res = plant(crop)
-            cyc.add("fields", f"replant {label}", ok(res), msg(res))
 
 
 def _market_html(sess: requests.Session) -> str:
