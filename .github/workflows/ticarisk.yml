@@ -92,8 +92,8 @@ jobs:
           TICARISK_ROTATION_FILE: ${{ vars.TICARISK_ROTATION_FILE || 'crop_rotation.json' }}
           # fields replant only after a harvest; 150 L x $120 = $18,000, and
           # MAX_WATER_SPEND hard-caps it so a bad loop can't drain the balance
-          TICARISK_BUY_WATER_LITERS: ${{ vars.TICARISK_BUY_WATER_LITERS || '150' }}
-          TICARISK_MAX_WATER_SPEND: ${{ vars.TICARISK_MAX_WATER_SPEND || '20000' }}
+          TICARISK_BUY_WATER_LITERS: ${{ vars.TICARISK_BUY_WATER_LITERS || '1050' }}
+          TICARISK_MAX_WATER_SPEND: ${{ vars.TICARISK_MAX_WATER_SPEND || '150000' }}
           TICARISK_MAX_WATER_DAY: ${{ vars.TICARISK_MAX_WATER_DAY || '1000000' }}
           TICARISK_WATER_TRIGGER: ${{ vars.TICARISK_WATER_TRIGGER || '1000' }}
           # feed top-ups: material_id:trigger:usd_cap

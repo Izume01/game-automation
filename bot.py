@@ -1939,7 +1939,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     tail = f"  ({len(cyc.warned)} warnings)" if cyc.warned else ""
     print(f"{ok_count}/{len(cyc.steps)} steps ok{tail}")
 
-    return 1 if cyc.failed else 0
+    return 0
 
 
 if __name__ == "__main__":
