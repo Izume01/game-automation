@@ -28,7 +28,7 @@ on:
         default: false
       sections:
         description: "Comma separated sections to run"
-        default: "production,fields,orchards,barns,coops,bees,math"
+        default: "production,fields,orchards,barns,coops,bees,math,jobs"
 
 permissions:
   contents: read
@@ -78,7 +78,7 @@ jobs:
         env:
           INPUTS: ${{ inputs.sections }}
         run: |
-          SECTIONS="${INPUTS:-production,fields,orchards,barns,coops,bees,math}"
+          SECTIONS="${INPUTS:-production,fields,orchards,barns,coops,bees,math,jobs}"
           echo "sections=$SECTIONS" >> "$GITHUB_OUTPUT"
           echo "running sections: $SECTIONS"
 

@@ -56,7 +56,7 @@ BASE = os.environ.get("TICARISK_BASE", "https://www.ticarisk.com").rstrip("/")
 USER = os.environ.get("TICARISK_USER", "")
 PASSWORD = os.environ.get("TICARISK_PASS", "")
 
-DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math"
+DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math,jobs"
 
 # Math game (matematik.php). Each question is a PNG, so this section shells out
 # to the tesseract binary; without it, the section reports itself skipped.
@@ -1902,6 +1902,98 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
         cyc.add("math", "withdraw vault", ok(w), msg(w), soft=not ok(w))
 
 
+# --------------------------------------------------------------------------- jobs
+
+
+def section_jobs(sess, cyc: Cycle, inspect: bool) -> None:
+    """Routine Jobs (jobs.php): collects completed job salaries and restarts idle jobs."""
+    page = get(sess, "/jobs.php")
+    if inspect:
+        dump("inspect/jobs.html", page)
+
+    csrf = ""
+    m_csrf = (
+        re.search(r'data-csrf="([0-9a-f]{64})"', page)
+        or re.search(r'name="csrf_token"\s+value="([^"]+)"', page)
+        or re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', page)
+    )
+    if m_csrf:
+        csrf = m_csrf.group(1)
+
+    # Extract all action keywords found inside the page scripts
+    script_actions = set(re.findall(r'action\s*:\s*[\'"]([^\'"]+)[\'"]', page))
+
+    # 1. Bulk Collect
+    collect_actions = [a for a in script_actions if "topla" in a or "collect" in a]
+    collect_candidates = collect_actions + [
+        "toplu_topla",
+        "collect_all",
+        "toplu_is_topla",
+        "toplu_gelir_topla",
+        "toplu_islem_topla",
+        "toplu_tum_is_topla",
+    ]
+    collected = False
+    for act in collect_candidates:
+        r = post(sess, "/jobs.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+        if isinstance(r, dict) and r.get("success"):
+            cyc.add("jobs", "collect all", True, msg(r))
+            collected = True
+            break
+        elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("zaten", "ready", "bekle", "yok", "tamamlan")):
+            cyc.add("jobs", "collect all", True, msg(r), soft=True)
+            collected = True
+            break
+
+    # Discover job IDs
+    job_ids = sorted(
+        set(
+            re.findall(r'data-job(?:-id)?="(\d+)"', page)
+            + re.findall(r'name="job_id"\s+value="(\d+)"', page)
+            + re.findall(r'data-id="(\d+)"', page)
+            + re.findall(r'id="job[_-]?(\d+)"', page)
+            + re.findall(r'onclick="[^"]*?(?:topla|collect|baslat|start)[^\d]*(\d+)', page, re.I)
+        ),
+        key=int,
+    )
+
+    if not collected and job_ids:
+        for jid in job_ids:
+            r_col = post(sess, "/jobs.php", {"action": "topla", "job_id": str(jid), "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+            if isinstance(r_col, dict) and r_col.get("success"):
+                cyc.add("jobs", f"collect job {jid}", True, msg(r_col))
+
+    # 2. Bulk Start / Individual Start
+    start_actions = [a for a in script_actions if "baslat" in a or "start" in a]
+    start_candidates = start_actions + [
+        "toplu_baslat",
+        "start_all",
+        "toplu_is_baslat",
+        "toplu_islem_baslat",
+        "toplu_tum_is_baslat",
+    ]
+    started = False
+    for act in start_candidates:
+        r = post(sess, "/jobs.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+        if isinstance(r, dict) and r.get("success"):
+            cyc.add("jobs", "start all", True, msg(r))
+            started = True
+            break
+        elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("enerji", "energy", "yetersiz", "devam")):
+            cyc.add("jobs", "start all", True, msg(r), soft=True)
+            started = True
+            break
+
+    if not started and job_ids:
+        for jid in job_ids:
+            r_st = post(sess, "/jobs.php", {"action": "baslat", "job_id": str(jid), "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+            if isinstance(r_st, dict) and r_st.get("success"):
+                cyc.add("jobs", f"start job {jid}", True, msg(r_st))
+            elif isinstance(r_st, dict) and any(w in str(msg(r_st)).lower() for w in ("enerji", "energy")):
+                cyc.add("jobs", f"start job {jid}", True, msg(r_st), soft=True)
+                break
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -1928,6 +2020,8 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         section_bees(sess, cyc, inspect)
     if "math" in sections:
         section_math(sess, cyc, inspect)
+    if "jobs" in sections:
+        section_jobs(sess, cyc, inspect)
 
     if inspect:
         pages_to_dump = [
