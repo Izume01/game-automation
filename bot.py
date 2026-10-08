@@ -66,7 +66,7 @@ BANK_AUTO_WITHDRAW = os.environ.get("TICARISK_BANK_WITHDRAW", "1") == "1"
 # Math game (matematik.php). Each question is a PNG, so this section shells out
 # to the tesseract binary; without it, the section reports itself skipped.
 MATH_ON = os.environ.get("TICARISK_MATH", "1") == "1"
-MATH_MAX = int(os.environ.get("TICARISK_MATH_MAX", "400"))   # safety stop
+MATH_MAX = int(os.environ.get("TICARISK_MATH_MAX", "650"))   # safety stop (covers full ~560k/hr pool)
 MATH_WITHDRAW = os.environ.get("TICARISK_MATH_WITHDRAW", "1") == "1"
 # Hard floor: the server rejects an answer arriving under ~1.4 s. OCR and both
 # round trips are fitted INSIDE this window, so a question costs ~1.6 s total —

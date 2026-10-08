@@ -109,7 +109,7 @@ jobs:
           TICARISK_PETEK_MAX_SPEND: ${{ vars.TICARISK_PETEK_MAX_SPEND || '60000' }}
           TICARISK_MATH: ${{ vars.TICARISK_MATH || '1' }}
           TICARISK_MATH_OP_TYPE: ${{ vars.TICARISK_MATH_OP_TYPE || 'carpma' }}
-          TICARISK_MATH_MAX: ${{ vars.TICARISK_MATH_MAX || '400' }}
+          TICARISK_MATH_MAX: ${{ vars.TICARISK_MATH_MAX || '650' }}
           TICARISK_MATH_WITHDRAW: ${{ vars.TICARISK_MATH_WITHDRAW || '1' }}
           TICARISK_MATH_MIN_MS: ${{ vars.TICARISK_MATH_MIN_MS || '1500' }}
           # the math section sets its own pacing, so only the farm needs the
