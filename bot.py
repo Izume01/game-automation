@@ -87,8 +87,15 @@ CAPTCHA_MAX_GATES = int(os.environ.get("TICARISK_CAPTCHA_MAX_GATES", "60"))
 # rotation is off. The live list is read from the page's bulk-plant select.
 CROP_ID = int(os.environ.get("TICARISK_CROP_ID", "4"))
 
-# Bulk-plant rotation. 1 = walk the crop list forward one step per planting
-# round (Wheat -> Potato -> Carrot -> ... ), 0 = always plant CROP_ID.
+# Bulk-plant rotation.
+# "daily" = dedicates 1 full calendar day to each crop in rotation (Tomato -> Carrot -> Potato -> Wheat)
+# "cycle" = steps forward to the next crop on every planting cycle
+CROP_ROTATION_MODE = os.environ.get("TICARISK_ROTATION_MODE", "daily")
+CROP_DAILY_LIST = [
+    int(x.strip())
+    for x in os.environ.get("TICARISK_DAILY_CROPS", "3,5,4,1").split(",")
+    if x.strip().isdigit()
+]
 CROP_ROTATION = os.environ.get("TICARISK_CROP_ROTATION", "1") == "1"
 ROTATION_FILE = os.environ.get("TICARISK_ROTATION_FILE", "crop_rotation.json")
 
@@ -421,17 +428,19 @@ def _write_rotation(path: str, idx: int) -> None:
 
 
 def pick_crop(opts: Dict[int, str], html: str) -> Tuple[int, str, str]:
-    """(crop id, name, why) for the next bulk planting.
-
-    The cursor is a small file so consecutive local runs walk forward. In a
-    fresh checkout (GitHub Actions) there is no file, so the starting point is
-    re-derived from the field page: start *after* whatever is growing now.
-    Either way successive rounds land on a different crop instead of the same
-    one forever.
-    """
+    """(crop id, name, why) for the next bulk planting."""
     ids = list(opts)
     if not ids:
         return CROP_ID, str(CROP_ID), "no crop list parsed"
+
+    if CROP_ROTATION_MODE == "daily" and CROP_DAILY_LIST:
+        now_trt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)
+        today = now_trt.date()
+        idx = today.toordinal() % len(CROP_DAILY_LIST)
+        target_id = CROP_DAILY_LIST[idx]
+        if target_id in opts:
+            name = opts[target_id]
+            return target_id, name, f"daily calendar rotation (Day #{idx + 1}/{len(CROP_DAILY_LIST)}: {name} on {today} TRT)"
 
     if not CROP_ROTATION:
         i = ids.index(CROP_ID) if CROP_ID in ids else 0
