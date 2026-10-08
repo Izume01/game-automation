@@ -1929,6 +1929,13 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
     if "math" in sections:
         section_math(sess, cyc, inspect)
 
+    if inspect:
+        for p in ("jobs", "bank", "balikcilik"):
+            try:
+                dump(f"inspect/{p}.html", get(sess, f"/{p}.php"))
+            except Exception as exc:
+                log.debug("inspect dump %s failed: %s", p, exc)
+
     bal = balance(sess)
     if bal is not None:
         cyc.add("account", "balance", True, f"${bal:,.2f}")
