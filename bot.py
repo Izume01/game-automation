@@ -1617,7 +1617,7 @@ def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
 
 
 def _clean_image(path: str) -> Optional[str]:
-    """Clean image at native resolution, removing isolated noise dots while preserving stroke fidelity."""
+    """Clean image at native resolution, removing isolated noise stars via connected components."""
     try:
         with open(path, "rb") as fh:
             data = fh.read()
@@ -1625,17 +1625,30 @@ def _clean_image(path: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         return None
 
-    fg = arr.mean(2) > 95
-    n = np.zeros(fg.shape, dtype=np.int16)
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            if dx == 0 and dy == 0:
-                continue
-            n += np.roll(np.roll(fg, dy, 0), dx, 1)
-    keep = fg.copy()
-    keep[1:-1, 1:-1] = fg[1:-1, 1:-1] & (n[1:-1, 1:-1] >= 2)
+    vals = arr.mean(2)
+    fg = vals > 35
+    visited = np.zeros(fg.shape, dtype=bool)
+    clean_fg = np.zeros(fg.shape, dtype=bool)
+    h, w = fg.shape
 
-    out = np.where(keep, 0, 255).astype(np.uint8)
+    for y in range(h):
+        for x in range(w):
+            if fg[y, x] and not visited[y, x]:
+                q = [(y, x)]
+                visited[y, x] = True
+                comp = [(y, x)]
+                for cy, cx in q:
+                    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+                        ny, nx = cy + dy, cx + dx
+                        if 0 <= ny < h and 0 <= nx < w and fg[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            q.append((ny, nx))
+                            comp.append((ny, nx))
+                if len(comp) >= 18:
+                    for cy, cx in comp:
+                        clean_fg[cy, cx] = True
+
+    out = np.where(clean_fg, 0, 255).astype(np.uint8)
     out = np.pad(out, 16, mode="constant", constant_values=255)
     dest = path + ".clean.pgm"
     try:
