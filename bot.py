@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import json
 import logging
 import os
@@ -55,7 +56,24 @@ BASE = os.environ.get("TICARISK_BASE", "https://www.ticarisk.com").rstrip("/")
 USER = os.environ.get("TICARISK_USER", "")
 PASSWORD = os.environ.get("TICARISK_PASS", "")
 
-DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math"
+DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math,conquest"
+
+# Conquest & Territory Warfare (harita_oyunu.php + security.php)
+CONQUEST_ON = os.environ.get("TICARISK_CONQUEST", "1") == "1"
+CONQUEST_COLLECT = os.environ.get("TICARISK_CONQUEST_COLLECT", "1") == "1"
+# Priority targets: 60 = Kanberra (Free), 6 = Ankara (expires 21:36 TRT), 29 = Athens (01:26 TRT), 33 = Sofia (01:46 TRT)
+CONQUEST_TARGETS = [
+    int(x.strip())
+    for x in os.environ.get("TICARISK_CONQUEST_TARGETS", "60,6,29,33").split(",")
+    if x.strip().isdigit()
+]
+CONQUEST_AUTO_ATTACK = os.environ.get("TICARISK_CONQUEST_AUTO_ATTACK", "1") == "1"
+CONQUEST_AUTO_BUY_BULLETS = os.environ.get("TICARISK_CONQUEST_AUTO_BUY_BULLETS", "1") == "1"
+CONQUEST_BUY_GUARDS = os.environ.get("TICARISK_CONQUEST_BUY_GUARDS", "1") == "1"
+CONQUEST_BUY_EQUIPMENT = os.environ.get("TICARISK_CONQUEST_BUY_EQUIPMENT", "1") == "1"
+CONQUEST_DEFENSE_BULLETS = int(os.environ.get("TICARISK_CONQUEST_DEFENSE_BULLETS", "25000"))
+CONQUEST_MAX_ATTACK_BULLETS = int(os.environ.get("TICARISK_CONQUEST_MAX_BULLETS", "120000"))
+CONQUEST_MAX_BULLET_PRICE = int(os.environ.get("TICARISK_CONQUEST_MAX_BULLET_PRICE", "100"))
 
 # Math game (matematik.php). Each question is a PNG, so this section shells out
 # to the tesseract binary; without it, the section reports itself skipped.
@@ -293,6 +311,8 @@ BENIGN_RE = re.compile(
     r"|hourly round limit"
     r"|limit reached"
     r"|try again next hour"
+    r"|no income accumulated yet"
+    r"|wait at least 1 hour"
     r")",
     re.I,
 )
@@ -1899,6 +1919,273 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
         cyc.add("math", "withdraw vault", ok(w), msg(w), soft=not ok(w))
 
 
+# --------------------------------------------------------------------------- conquest & defense
+
+
+def _get_security_csrf(sess: requests.Session) -> str:
+    """Extract CSRF token from security.php meta tag."""
+    sec_html = get(sess, "/security.php")
+    m = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', sec_html)
+    if m:
+        return m.group(1)
+    m = re.search(r'name="csrf_token"\s+value="([^"]+)"', sec_html)
+    if m:
+        return m.group(1)
+    return "ce066e3a464ca7589bb1a12eed4bb781e6f89f2bdec0cf8c057415524d2"
+
+
+def _buy_bullets_if_needed(sess: requests.Session, needed_bullets: int, current_bullets: int) -> Tuple[bool, str, int]:
+    """Attempt to buy bullets in bulk (respecting 30m cooldown and cash balance)."""
+    deficit = needed_bullets - current_bullets
+    if deficit <= 0:
+        return False, "sufficient bullets owned", current_bullets
+
+    try:
+        sec_html = get(sess, "/security.php")
+        m_price = re.search(r'id="currentNormalPrice">\$(\d+)', sec_html)
+        price = int(m_price.group(1)) if m_price else 88
+        if price > CONQUEST_MAX_BULLET_PRICE:
+            return False, f"bullet price ${price}/ea exceeds max ${CONQUEST_MAX_BULLET_PRICE}", current_bullets
+
+        bal = balance(sess) or 0.0
+        max_by_cash = int(bal // price)
+        buy_qty = min(deficit, max_by_cash, 1000000)
+        if buy_qty < 1:
+            return False, f"cannot afford bullets (${bal:,.2f} cash available at ${price}/ea)", current_bullets
+
+        csrf = _get_security_csrf(sess)
+        res = post(
+            sess,
+            "/security.php",
+            {
+                "action": "buy_bullets",
+                "amount": str(buy_qty),
+                "use_black_money": "0",
+                "csrf_token": csrf,
+                "ajax": "true",
+            },
+            pause=False,
+        )
+        if res.get("success"):
+            new_total = current_bullets + buy_qty
+            log.info("conquest: bought %d bullets at $%d/ea -> total %d bullets", buy_qty, price, new_total)
+            return True, f"bought {buy_qty:,} bullets at ${price}/ea (${buy_qty * price:,.2f})", new_total
+        else:
+            return False, msg(res), current_bullets
+    except Exception as exc:
+        return False, f"bullet purchase failed: {exc}", current_bullets
+
+
+def _auto_buy_guard_and_equipment(sess: requests.Session, cyc: Cycle) -> None:
+    """Hire guard and purchase equipment on security.php to fortify defenses."""
+    try:
+        csrf = _get_security_csrf(sess)
+        # 1. Hire Private Security (guard_id 1)
+        r_guard = post(
+            sess,
+            "/security.php",
+            {
+                "action": "buy_guard",
+                "guard_id": "1",
+                "use_black_money": "0",
+                "use_diamonds": "0",
+                "csrf_token": csrf,
+                "ajax": "true",
+            },
+            pause=False,
+        )
+        guard_msg = msg(r_guard)
+        if r_guard.get("success"):
+            cyc.add("conquest", "hire guard", True, guard_msg)
+        else:
+            cyc.add("conquest", "hire guard", True, guard_msg, soft=True)
+
+        # 2. Buy Equipment (equipment_id 3: Desert Eagle .50, $600k)
+        if CONQUEST_BUY_EQUIPMENT:
+            r_eq = post(
+                sess,
+                "/security.php",
+                {
+                    "action": "buy_equipment",
+                    "equipment_id": "3",
+                    "use_black_money": "0",
+                    "use_diamonds": "0",
+                    "csrf_token": csrf,
+                    "ajax": "true",
+                },
+                pause=False,
+            )
+            eq_msg = msg(r_eq)
+            if r_eq.get("success"):
+                cyc.add("conquest", "buy equipment", True, "Desert Eagle .50 purchased")
+                post(
+                    sess,
+                    "/security.php",
+                    {
+                        "action": "equip_guard",
+                        "guard_id": "1",
+                        "equipment_id": "3",
+                        "csrf_token": csrf,
+                        "ajax": "true",
+                    },
+                    pause=False,
+                )
+            else:
+                cyc.add("conquest", "buy equipment", True, eq_msg, soft=True)
+
+        # 3. Pay salaries and train guards
+        post(sess, "/security.php", {"action": "pay_all_salaries", "csrf_token": csrf, "ajax": "true"}, pause=False)
+        post(sess, "/security.php", {"action": "train_all_guards", "csrf_token": csrf, "ajax": "true"}, pause=False)
+    except Exception as exc:
+        cyc.add("conquest", "hire guard/equipment", False, str(exc), soft=True)
+
+
+def section_conquest(sess: requests.Session, cyc: Cycle, inspect: bool) -> None:
+    """Territory conquest engine: collects rents, scans map, captures expiring/free lands, and fortifies defenses."""
+    if not CONQUEST_ON:
+        return
+
+    # 1. Hourly rent collection across all owned territories
+    if CONQUEST_COLLECT:
+        r_col = post(sess, "/harita_oyunu.php", {"action": "collect"}, pause=False)
+        col_msg = msg(r_col)
+        if r_col.get("success"):
+            cyc.add("conquest", "collect rent", True, col_msg)
+        else:
+            benign = bool(BENIGN_RE.search(col_msg))
+            cyc.add("conquest", "collect rent", benign, col_msg, soft=True)
+
+    # 2. Inspect map status and player resources
+    try:
+        map_html = get(sess, "/harita_oyunu.php")
+        if inspect:
+            dump("inspect/harita_oyunu.html", map_html.encode("utf-8"))
+
+        user_m = re.search(r'window\.__TICARISK_AUTH_USER\s*=\s*(\d+);', map_html)
+        user_id = int(user_m.group(1)) if user_m else None
+
+        bullets_m = re.search(r'let\s+ME_BULLETS\s*=\s*(\d+);', map_html)
+        user_bullets = int(bullets_m.group(1)) if bullets_m else 0
+
+        caps_m = re.search(r'let\s+ME_DAILY_CAPTURES_TODAY\s*=\s*(\d+);', map_html)
+        daily_captures = int(caps_m.group(1)) if caps_m else 0
+
+        raw_locs = sess.get(f"{BASE}/harita_oyunu.php?action=get_locations", timeout=REQUEST_TIMEOUT, verify=False)
+        raw_locs.raise_for_status()
+        locs: List[dict] = raw_locs.json()
+    except Exception as exc:
+        cyc.add("conquest", "map scan", False, f"failed to load map data: {exc}", soft=True)
+        return
+
+    # Check owned territories
+    my_locs = [l for l in locs if user_id and l.get("owner_id") == user_id]
+    if my_locs:
+        cyc.add(
+            "conquest",
+            "owned territories",
+            True,
+            f"holding {len(my_locs)}: " + ", ".join(f"{l['name']} (${l.get('hourly_income', 0):,}/hr)" for l in my_locs),
+        )
+        for loc in my_locs:
+            cur_def = int(loc.get("defense_bullets") or 0)
+            if cur_def < CONQUEST_DEFENSE_BULLETS and user_bullets > 0:
+                deficit = min(CONQUEST_DEFENSE_BULLETS - cur_def, user_bullets)
+                dep_res = post(
+                    sess,
+                    "/harita_oyunu.php",
+                    {"action": "add_bullets", "location_id": str(loc["id"]), "amount": str(deficit)},
+                    pause=False,
+                )
+                cyc.add("conquest", f"defend {loc['name']}", ok(dep_res), f"+{deficit:,} bullets ({msg(dep_res)})")
+                user_bullets = max(0, user_bullets - deficit)
+
+    if not CONQUEST_AUTO_ATTACK:
+        return
+
+    if daily_captures >= 3:
+        cyc.add("conquest", "daily limit", True, "daily capture limit reached (3/3)", soft=True)
+        return
+
+    server_now_str = ""
+    if locs and locs[0].get("server_now_ts") and locs[0].get("last_collected_ts") and locs[0].get("last_collected"):
+        try:
+            diff_sec = locs[0]["server_now_ts"] - locs[0]["last_collected_ts"]
+            dt_last = datetime.datetime.strptime(locs[0]["last_collected"], "%Y-%m-%d %H:%M:%S")
+            server_now = dt_last + datetime.timedelta(seconds=diff_sec)
+            server_now_str = server_now.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            server_now_str = ""
+
+    # Hunt viable capture targets (free or expired leases, 0 diamond cost)
+    candidates = []
+    for l in locs:
+        if (l.get("diamond_price") or 0) > 0:
+            continue
+        if user_id and l.get("owner_id") == user_id:
+            continue
+        if not l.get("owner_id") or l.get("owner_id") == 0:
+            candidates.append(l)
+            continue
+        exp = l.get("ownership_expires_at")
+        if exp and server_now_str and exp <= server_now_str:
+            candidates.append(l)
+
+    if not candidates:
+        cyc.add("conquest", "scout targets", True, "no free or expired territories available right now", soft=True)
+        return
+
+    def _rank(loc):
+        lid = loc.get("id")
+        prio = CONQUEST_TARGETS.index(lid) if lid in CONQUEST_TARGETS else 999
+        return (prio, -int(loc.get("hourly_income") or 0))
+
+    candidates.sort(key=_rank)
+    target = candidates[0]
+    target_id = target["id"]
+    target_name = target["name"]
+    hourly = int(target.get("hourly_income") or 0)
+    base_cost = int(round(hourly * 1.5))
+    target_bullets = min(CONQUEST_MAX_ATTACK_BULLETS, max(base_cost, 50000))
+
+    if user_bullets < target_bullets and CONQUEST_AUTO_BUY_BULLETS:
+        bought, bmsg, user_bullets = _buy_bullets_if_needed(sess, target_bullets, user_bullets)
+        if bought:
+            cyc.add("conquest", "buy bullets", True, bmsg)
+        else:
+            cyc.add("conquest", "buy bullets", True, bmsg, soft=True)
+
+    if user_bullets < 1:
+        cyc.add("conquest", f"attack {target_name}", False, f"insufficient bullets ({user_bullets} available)", soft=True)
+        return
+
+    commit_bullets = min(user_bullets, target_bullets)
+    log.info("conquest: attacking %s (ID %s) with %d bullets (base cost %d)", target_name, target_id, commit_bullets, base_cost)
+    atk_res = post(
+        sess,
+        "/harita_oyunu.php",
+        {"action": "attack", "location_id": str(target_id), "bullets_commit": str(commit_bullets)},
+        pause=False,
+    )
+    atk_ok = atk_res.get("success", False)
+    atk_text = msg(atk_res)
+    cyc.add("conquest", f"attack {target_name}", atk_ok, f"committed {commit_bullets:,} bullets — {atk_text}")
+
+    if atk_ok:
+        user_bullets = max(0, user_bullets - commit_bullets)
+        if user_bullets > 0 and CONQUEST_DEFENSE_BULLETS > 0:
+            def_amt = min(user_bullets, CONQUEST_DEFENSE_BULLETS)
+            post(
+                sess,
+                "/harita_oyunu.php",
+                {"action": "add_bullets", "location_id": str(target_id), "amount": str(def_amt)},
+                pause=False,
+            )
+            cyc.add("conquest", f"defend {target_name}", True, f"+{def_amt:,} defense bullets locked")
+
+        if CONQUEST_BUY_GUARDS:
+            _auto_buy_guard_and_equipment(sess, cyc)
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -1925,6 +2212,8 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         section_bees(sess, cyc, inspect)
     if "math" in sections:
         section_math(sess, cyc, inspect)
+    if "conquest" in sections:
+        section_conquest(sess, cyc, inspect)
 
     bal = balance(sess)
     if bal is not None:
