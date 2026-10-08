@@ -1930,7 +1930,7 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         section_math(sess, cyc, inspect)
 
     if inspect:
-        for p in ("jobs", "bank", "balikcilik"):
+        for p in ("jobs", "tamir", "ortak", "bank", "balikcilik"):
             try:
                 dump(f"inspect/{p}.html", get(sess, f"/{p}.php"))
             except Exception as exc:
