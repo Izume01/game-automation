@@ -2037,35 +2037,69 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
             cyc.add("tamir", "deliver finished repairs", True, msg(r))
             break
 
-    # Discover customer/repair IDs on page
-    repair_ids = sorted(
-        set(
-            re.findall(r'data-repair(?:-id)?="(\d+)"', page)
-            + re.findall(r'data-customer(?:-id)?="(\d+)"', page)
-            + re.findall(r'data-musteri(?:-id)?="(\d+)"', page)
-            + re.findall(r'name="repair_id"\s+value="(\d+)"', page)
-        ),
-        key=int,
+    # Discover waiting customers and their quoted payouts
+    candidates: List[Tuple[int, float]] = []
+    seen_ids = set()
+
+    for chunk in re.split(r'(?=<div[^>]*class=["\'][^"\']*(?:card|customer|musteri|item|repair|slot))', page):
+        id_m = (
+            re.search(r'data-(?:id|repair-id|customer-id|musteri-id)=["\'](\d+)["\']', chunk)
+            or re.search(r'name=["\'](?:repair|customer|musteri)_id["\']\s+value=["\'](\d+)["\']', chunk)
+            or re.search(r'onclick=["\'][^"\']*?(?:tamire_al|tamir|accept)[^\d]*(\d+)', chunk, re.I)
+        )
+        if not id_m:
+            continue
+        cid = int(id_m.group(1))
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+
+        # Extract price / payout quote
+        price_m = (
+            re.search(r'data-(?:price|fiyat|ucret|odul|kazanc)=["\']([0-9.,]+)["\']', chunk)
+            or re.search(r'\$([0-9,.]+)', chunk)
+            or re.search(r'([0-9,.]+)\s*(?:\$|TL)', chunk)
+        )
+        price = 0.0
+        if price_m:
+            raw_p = price_m.group(1).replace("$", "").replace("TL", "").strip()
+            if raw_p.count(",") == 1 and raw_p.count(".") == 0:
+                raw_p = raw_p.replace(",", "")
+            elif raw_p.count(".") == 1 and raw_p.count(",") == 0 and len(raw_p.split(".")[-1]) == 3:
+                raw_p = raw_p.replace(".", "")
+            else:
+                raw_p = raw_p.replace(",", "")
+            try:
+                price = float(raw_p)
+            except ValueError:
+                price = 0.0
+        candidates.append((cid, price))
+
+    # Add any raw IDs not mapped to chunks
+    all_raw_ids = set(
+        re.findall(r'data-repair(?:-id)?="(\d+)"', page)
+        + re.findall(r'data-customer(?:-id)?="(\d+)"', page)
+        + re.findall(r'data-musteri(?:-id)?="(\d+)"', page)
+        + re.findall(r'name="repair_id"\s+value="(\d+)"', page)
     )
+    for rid_s in all_raw_ids:
+        rid = int(rid_s)
+        if rid not in seen_ids:
+            candidates.append((rid, 0.0))
+            seen_ids.add(rid)
 
-    # 2. Start / Accept repairs for waiting customers
-    start_candidates = [a for a in script_actions if any(k in a for k in ("baslat", "start", "accept", "tamire_al"))]
-    start_candidates += ["tamir_baslat", "tamire_al", "start_repair", "accept_customer"]
-    started = False
-    for act in start_candidates:
-        r = post(sess, "/tamir.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
-        if isinstance(r, dict) and r.get("success"):
-            cyc.add("tamir", "start repairs", True, msg(r))
-            started = True
-            break
+    # PRIORITIZE: Sort waiting customers by HIGHEST paying repair first
+    candidates.sort(key=lambda x: x[1], reverse=True)
 
-    if repair_ids:
-        for rid in repair_ids:
+    # 2. Start / Accept highest-paying repairs first into open bays
+    if candidates:
+        for rid, price in candidates:
             r = post(sess, "/tamir.php", {"action": "tamire_al", "repair_id": str(rid), "customer_id": str(rid), "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
             if isinstance(r, dict) and r.get("success"):
-                cyc.add("tamir", f"start repair {rid}", True, msg(r))
+                label = f"${price:,.0f}" if price > 0 else "top quote"
+                cyc.add("tamir", f"start repair {rid} ({label})", True, msg(r))
             elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "slot", "kapasite", "full", "max")):
-                cyc.add("tamir", f"repair bays full ({rid})", True, msg(r), soft=True)
+                cyc.add("tamir", f"repair bays full (holding lower-paying jobs)", True, msg(r), soft=True)
                 break
 
     # 3. Call New Customers ("+ Call new customer")
