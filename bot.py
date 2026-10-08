@@ -61,18 +61,19 @@ DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math,conquest"
 # Conquest & Territory Warfare (harita_oyunu.php + security.php)
 CONQUEST_ON = os.environ.get("TICARISK_CONQUEST", "1") == "1"
 CONQUEST_COLLECT = os.environ.get("TICARISK_CONQUEST_COLLECT", "1") == "1"
-# Priority targets: 60 = Kanberra (Free), 6 = Ankara (expires 21:36 TRT), 29 = Athens (01:26 TRT), 33 = Sofia (01:46 TRT)
+# Priority targets: 30 = Baghdad (150k), 69 = Dakka (112k), 57 = Ulan Batur (225k)
 CONQUEST_TARGETS = [
     int(x.strip())
-    for x in os.environ.get("TICARISK_CONQUEST_TARGETS", "60,6,29,33").split(",")
+    for x in os.environ.get("TICARISK_CONQUEST_TARGETS", "30,69,57").split(",")
     if x.strip().isdigit()
 ]
 CONQUEST_AUTO_ATTACK = os.environ.get("TICARISK_CONQUEST_AUTO_ATTACK", "1") == "1"
+CONQUEST_MIN_WIN_CHANCE = int(os.environ.get("TICARISK_CONQUEST_MIN_WIN_CHANCE", "80"))
 CONQUEST_AUTO_BUY_BULLETS = os.environ.get("TICARISK_CONQUEST_AUTO_BUY_BULLETS", "1") == "1"
 CONQUEST_BUY_GUARDS = os.environ.get("TICARISK_CONQUEST_BUY_GUARDS", "1") == "1"
 CONQUEST_BUY_EQUIPMENT = os.environ.get("TICARISK_CONQUEST_BUY_EQUIPMENT", "1") == "1"
 CONQUEST_DEFENSE_BULLETS = int(os.environ.get("TICARISK_CONQUEST_DEFENSE_BULLETS", "25000"))
-CONQUEST_MAX_ATTACK_BULLETS = int(os.environ.get("TICARISK_CONQUEST_MAX_BULLETS", "120000"))
+CONQUEST_MAX_ATTACK_BULLETS = int(os.environ.get("TICARISK_CONQUEST_MAX_BULLETS", "250000"))
 CONQUEST_MAX_BULLET_PRICE = int(os.environ.get("TICARISK_CONQUEST_MAX_BULLET_PRICE", "100"))
 
 # Math game (matematik.php). Each question is a PNG, so this section shells out
@@ -2188,7 +2189,18 @@ def section_conquest(sess: requests.Session, cyc: Cycle, inspect: bool) -> None:
         return
 
     commit_bullets = min(user_bullets, target_bullets)
-    log.info("conquest: attacking %s (ID %s) with %d bullets (base cost %d)", target_name, target_id, commit_bullets, base_cost)
+    est_win_chance = min(92, int(82 * (commit_bullets / max(1, base_cost))))
+    if est_win_chance < CONQUEST_MIN_WIN_CHANCE:
+        cyc.add(
+            "conquest",
+            f"hold attack {target_name}",
+            True,
+            f"estimated chance {est_win_chance}% is below safe threshold {CONQUEST_MIN_WIN_CHANCE}% (holding bankroll for high odds)",
+            soft=True,
+        )
+        return
+
+    log.info("conquest: attacking %s (ID %s) with %d bullets (base cost %d, win chance %d%%)", target_name, target_id, commit_bullets, base_cost, est_win_chance)
     atk_res = post(
         sess,
         "/harita_oyunu.php",
