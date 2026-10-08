@@ -1617,37 +1617,13 @@ def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
 
 
 def _clean_image(path: str) -> Optional[str]:
-    """Replicate the userscript's cleanImage(), smoothly upscaling and binarizing."""
-    magick = shutil.which("magick") or shutil.which("convert")
-    scaled_3x = path + ".3x.png"
-    src_path = path
-    if magick:
-        try:
-            subprocess.run(
-                [magick, path, "-resize", "300%", scaled_3x],
-                capture_output=True, timeout=30, check=True,
-            )
-            src_path = scaled_3x
-        except (OSError, subprocess.SubprocessError):
-            src_path = path
-
+    """Clean image at native resolution, removing isolated noise dots while preserving stroke fidelity."""
     try:
-        with open(src_path, "rb") as fh:
+        with open(path, "rb") as fh:
             data = fh.read()
         arr, _w, _h = _im_load(data)
     except Exception:  # noqa: BLE001
         return None
-    finally:
-        if src_path != path and os.path.exists(src_path):
-            try:
-                os.remove(src_path)
-            except OSError:
-                pass
-
-    # Discard top/bottom noise stars: question text is strictly in the central band
-    if arr.shape[0] >= 100:
-        h_arr = arr.shape[0]
-        arr = arr[int(h_arr * 0.25):int(h_arr * 0.75), :]
 
     fg = arr.mean(2) > 95
     n = np.zeros(fg.shape, dtype=np.int16)
@@ -1660,7 +1636,7 @@ def _clean_image(path: str) -> Optional[str]:
     keep[1:-1, 1:-1] = fg[1:-1, 1:-1] & (n[1:-1, 1:-1] >= 2)
 
     out = np.where(keep, 0, 255).astype(np.uint8)
-    out = np.pad(out, 24, mode="constant", constant_values=255)
+    out = np.pad(out, 16, mode="constant", constant_values=255)
     dest = path + ".clean.pgm"
     try:
         with open(dest, "wb") as fh:
@@ -1672,49 +1648,48 @@ def _clean_image(path: str) -> Optional[str]:
 
 
 def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
-    """OCR a question image, trusting only a reading the passes agree on.
+    """OCR a question image using dual passes on both cleaned and raw image.
 
     Returns (a, b, text).
     """
     wl = "0123456789+-*x "
-    raw: List[str] = []
+    votes: Dict[Tuple[int, int], int] = {}
+    sample_texts: Dict[Tuple[int, int], str] = {}
 
-    def run(args: List[str]) -> None:
-        try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=60)
-        except (OSError, subprocess.SubprocessError):
-            return
-        t = " ".join((r.stdout or "").split())
-        if t:
-            raw.append(t)
+    def scan(img_path: str, weight: int = 1) -> None:
+        base = ["tesseract", img_path, "stdout", "-l", "eng",
+                "-c", f"tessedit_char_whitelist={wl}"]
+        for psm in ("7", "6"):
+            try:
+                r = subprocess.run(base + ["--psm", psm], capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            t = " ".join((r.stdout or "").split())
+            pair = _parse_reading(t)
+            if pair is not None:
+                votes[pair] = votes.get(pair, 0) + weight
+                if pair not in sample_texts:
+                    sample_texts[pair] = t
 
     clean = _clean_image(path)
-    src = clean or path
-    base = ["tesseract", src, "stdout", "-l", "eng",
-            "-c", f"tessedit_char_whitelist={wl}"]
-    for psm in ("6", "7", "3"):
-        run(base + ["--psm", psm])
+    if clean:
+        scan(clean, weight=2)
+        try:
+            os.remove(clean)
+        except OSError:
+            pass
 
-    for junk in (clean, clean and clean.replace(".clean.pgm", ".clean.pgm")):
-        if junk and os.path.exists(junk):
-            try:
-                os.remove(junk)
-            except OSError:
-                pass
+    scan(path, weight=1)
 
-    votes: Dict[Tuple[int, int], int] = {}
-    for t in raw:
-        pair = _parse_reading(t)
-        if pair is not None:
-            votes[pair] = votes.get(pair, 0) + 1
     if not votes:
         fallback_txt = _ocr_png(path)
         pair = _parse_reading(fallback_txt)
         if pair is not None:
             return pair[0], pair[1], fallback_txt
         return None
+
     (a, b), _n = max(votes.items(), key=lambda kv: kv[1])
-    return a, b, raw[0]
+    return a, b, sample_texts.get((a, b), f"{a} * {b}")
 
 
 def _pick_math_op(text: str, tipi: str) -> str:
