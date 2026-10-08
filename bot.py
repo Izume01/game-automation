@@ -2050,11 +2050,14 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
             started = True
             break
 
-    if not started and repair_ids:
+    if repair_ids:
         for rid in repair_ids:
             r = post(sess, "/tamir.php", {"action": "tamire_al", "repair_id": str(rid), "customer_id": str(rid), "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
             if isinstance(r, dict) and r.get("success"):
                 cyc.add("tamir", f"start repair {rid}", True, msg(r))
+            elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "slot", "kapasite", "full", "max")):
+                cyc.add("tamir", f"repair bays full ({rid})", True, msg(r), soft=True)
+                break
 
     # 3. Call New Customers ("+ Call new customer")
     call_candidates = [a for a in script_actions if any(k in a for k in ("musteri", "call", "customer"))]
@@ -2066,8 +2069,8 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
             cyc.add("tamir", "call new customer", True, msg(r))
             called = True
             break
-        elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "limit", "bekle", "max")):
-            cyc.add("tamir", "customer slots", True, msg(r), soft=True)
+        elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "limit", "bekle", "max", "dakika", "saniye", "cooldown")):
+            cyc.add("tamir", "customer cooldown", True, msg(r), soft=True)
             called = True
             break
     if not called:
@@ -2160,6 +2163,10 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         _animals(sess, cyc, inspect, "coops", "kumesler", "kumes")
     if "bees" in sections:
         section_bees(sess, cyc, inspect)
+    if "tamir" in sections:
+        section_tamir(sess, cyc, inspect)
+    if "jobs" in sections:
+        section_jobs(sess, cyc, inspect)
     if "math" in sections:
         section_math(sess, cyc, inspect)
     if "jobs" in sections:
