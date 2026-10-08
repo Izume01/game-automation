@@ -1930,11 +1930,19 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         section_math(sess, cyc, inspect)
 
     if inspect:
-        for p in ("jobs", "tamir", "ortak", "bank", "balikcilik"):
+        pages_to_dump = [
+            ("jobs", "/jobs.php"),
+            ("tamir", "/tamir.php"),
+            ("ortak", "/ortak.php"),
+            ("lojistik", "/lojistik.php?sekme=gorevler"),
+            ("bank", "/bank.php"),
+            ("balikcilik", "/balikcilik.php"),
+        ]
+        for name, uri in pages_to_dump:
             try:
-                dump(f"inspect/{p}.html", get(sess, f"/{p}.php"))
+                dump(f"inspect/{name}.html", get(sess, uri))
             except Exception as exc:
-                log.debug("inspect dump %s failed: %s", p, exc)
+                log.debug("inspect dump %s failed: %s", name, exc)
 
     bal = balance(sess)
     if bal is not None:
