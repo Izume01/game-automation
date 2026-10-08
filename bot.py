@@ -1977,37 +1977,21 @@ def _buy_bullets_if_needed(sess: requests.Session, needed_bullets: int, current_
 
 
 def _auto_buy_guard_and_equipment(sess: requests.Session, cyc: Cycle) -> None:
-    """Hire guard and purchase equipment on security.php to fortify defenses."""
+    """Hire highest eligible guard tier and purchase best equipment loadout."""
     try:
         csrf = _get_security_csrf(sess)
-        # 1. Hire Private Security (guard_id 1)
-        r_guard = post(
-            sess,
-            "/security.php",
-            {
-                "action": "buy_guard",
-                "guard_id": "1",
-                "use_black_money": "0",
-                "use_diamonds": "0",
-                "csrf_token": csrf,
-                "ajax": "true",
-            },
-            pause=False,
-        )
-        guard_msg = msg(r_guard)
-        if r_guard.get("success"):
-            cyc.add("conquest", "hire guard", True, guard_msg)
-        else:
-            cyc.add("conquest", "hire guard", True, guard_msg, soft=True)
 
-        # 2. Buy Equipment (equipment_id 3: Desert Eagle .50, $600k)
-        if CONQUEST_BUY_EQUIPMENT:
-            r_eq = post(
+        # 1. Try hiring best available guard tier (from Lv 31 Sniper down to Lv 10 Private Security)
+        # Guards: 8: Sniper (Lv31), 7: Agent (Lv28), 6: Ops Leader (Lv25), 5: Veteran (Lv22),
+        # 4: Professional (Lv19), 3: Commando (Lv16), 2: Bodyguard (Lv13), 1: Private Security (Lv10)
+        hired_guard_id = None
+        for gid in [8, 7, 6, 5, 4, 3, 2, 1]:
+            r_guard = post(
                 sess,
                 "/security.php",
                 {
-                    "action": "buy_equipment",
-                    "equipment_id": "3",
+                    "action": "buy_guard",
+                    "guard_id": str(gid),
                     "use_black_money": "0",
                     "use_diamonds": "0",
                     "csrf_token": csrf,
@@ -2015,23 +1999,68 @@ def _auto_buy_guard_and_equipment(sess: requests.Session, cyc: Cycle) -> None:
                 },
                 pause=False,
             )
-            eq_msg = msg(r_eq)
-            if r_eq.get("success"):
-                cyc.add("conquest", "buy equipment", True, "Desert Eagle .50 purchased")
-                post(
+            gmsg = msg(r_guard)
+            if r_guard.get("success"):
+                hired_guard_id = gid
+                cyc.add("conquest", f"hire guard (tier {gid})", True, gmsg)
+                break
+            elif "kapasite" in gmsg.lower() or "capacity" in gmsg.lower() or "max" in gmsg.lower():
+                cyc.add("conquest", "guard roster", True, gmsg, soft=True)
+                hired_guard_id = 1
+                break
+
+        if hired_guard_id is None:
+            cyc.add("conquest", "hire guard", True, "no eligible guard tier available", soft=True)
+            hired_guard_id = 1
+
+        # 2. Buy best weapons & equipment loadout
+        if CONQUEST_BUY_EQUIPMENT:
+            bal = balance(sess) or 0.0
+
+            # Weapon: SA-9 (ID 2, $2M, +90 Atk) if bal >= $3M, else Desert Eagle (ID 3, $600k, +45 Atk)
+            weapon_id = 2 if bal >= 3000000 else 3
+            # Armor: Carbon Fiber (ID 4, $2M, +120 Def) if bal >= $4M else Kevlar (ID 5, $1.1M, +90 Def)
+            armor_id = 4 if bal >= 4000000 else 5
+
+            loadout = [
+                (weapon_id, "best weapon"),
+                (armor_id, "body armor"),
+                (8, "steel helmet"),      # ID 8: $700k, +65 Def
+                (9, "tactical boots"),    # ID 9: $500k, +15 Atk / +35 Def
+            ]
+
+            for eq_id, eq_desc in loadout:
+                r_eq = post(
                     sess,
                     "/security.php",
                     {
-                        "action": "equip_guard",
-                        "guard_id": "1",
-                        "equipment_id": "3",
+                        "action": "buy_equipment",
+                        "equipment_id": str(eq_id),
+                        "use_black_money": "0",
+                        "use_diamonds": "0",
                         "csrf_token": csrf,
                         "ajax": "true",
                     },
                     pause=False,
                 )
-            else:
-                cyc.add("conquest", "buy equipment", True, eq_msg, soft=True)
+                eq_msg = msg(r_eq)
+                if r_eq.get("success"):
+                    cyc.add("conquest", f"buy {eq_desc}", True, f"equipment {eq_id} purchased ({eq_msg})")
+                    post(
+                        sess,
+                        "/security.php",
+                        {
+                            "action": "equip_guard",
+                            "guard_id": str(hired_guard_id),
+                            "equipment_id": str(eq_id),
+                            "csrf_token": csrf,
+                            "ajax": "true",
+                        },
+                        pause=False,
+                    )
+                else:
+                    if "insufficient" in eq_msg.lower() or "bakiye" in eq_msg.lower():
+                        break
 
         # 3. Pay salaries and train guards
         post(sess, "/security.php", {"action": "pay_all_salaries", "csrf_token": csrf, "ajax": "true"}, pause=False)
