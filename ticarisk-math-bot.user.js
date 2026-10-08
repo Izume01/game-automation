@@ -1428,7 +1428,7 @@
         try {
             if (!worker) { try { await initOCR(); } catch (e) { console.error('[MathBot] OCR init', e); } }
             for (let i = 0; i < MATH_MAX_ROUNDS; i++) {
-                const q = await postJson('/matematik.php', { action: 'get_question', islem_tipi: 'toplama' });
+                const q = await postJson('/matematik.php', { action: 'get_question', islem_tipi: 'carpma' });
                 if (!q || !q.success) { why = 'no question: ' + resText(q); break; }
 
                 const r = await readQuestion(q.question_image_url, q.islem_tipi);

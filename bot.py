@@ -66,6 +66,7 @@ MATH_WITHDRAW = os.environ.get("TICARISK_MATH_WITHDRAW", "1") == "1"
 # round trips are fitted INSIDE this window, so a question costs ~1.6 s total —
 # the pause between requests (TICARISK_PAUSE) is deliberately not added on top.
 MATH_MIN_MS = int(os.environ.get("TICARISK_MATH_MIN_MS", "1500"))
+MATH_OP_TYPE = os.environ.get("TICARISK_MATH_OP_TYPE", "carpma")
 MATH_OPS = {"toplama": "+", "cikarma": "-", "carpma": "*", "bolme": "/"}
 # Slider captcha. 5 rejected verify_human calls lock the account for 600 s, so
 # the budget is 4 — and it is spent ONE position per puzzle: burn a guess, drop
@@ -1773,7 +1774,7 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
             q = post(
                 sess,
                 "/matematik.php",
-                {"ajax_request": 1, "action": "get_question", "islem_tipi": "toplama"},
+                {"ajax_request": 1, "action": "get_question", "islem_tipi": MATH_OP_TYPE},
                 pause=False,
             )
             # The anti-bot timer starts when the server issues the question, so
