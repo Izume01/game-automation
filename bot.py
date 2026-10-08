@@ -56,7 +56,7 @@ BASE = os.environ.get("TICARISK_BASE", "https://www.ticarisk.com").rstrip("/")
 USER = os.environ.get("TICARISK_USER", "")
 PASSWORD = os.environ.get("TICARISK_PASS", "")
 
-DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math,jobs,tamir,bank"
+DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math,jobs,tamir,bank,ortak"
 
 # Bank 2% Daily Interest (bank.php)
 BANK_AUTO_DEPOSIT = os.environ.get("TICARISK_BANK_DEPOSIT", "1") == "1"
@@ -2161,7 +2161,8 @@ def section_bank(sess, cyc: Cycle, inspect: bool) -> None:
 
         if bal > BANK_RESERVE and currently_deposited < 30000000:
             deposit_amt = int(min(bal - BANK_RESERVE, 30000000 - currently_deposited))
-            if deposit_amt >= 100000:
+            deposit_amt = (deposit_amt // 1000) * 1000  # round down to nearest thousand
+            if deposit_amt >= 1000:
                 deposited = False
                 for act in ("deposit", "para_yatir", "yatir", "add_deposit"):
                     r = post(
@@ -2180,6 +2181,146 @@ def section_bank(sess, cyc: Cycle, inspect: bool) -> None:
                         break
                 if not deposited:
                     cyc.add("bank", "deposit", True, f"eligible ${deposit_amt:,} (reserve kept ${BANK_RESERVE:,.0f})", soft=True)
+
+
+# --------------------------------------------------------------------------- joint jobs (ortak.php)
+
+
+def section_ortak(sess, cyc: Cycle, inspect: bool) -> None:
+    """Joint Jobs (ortak.php): collects completed joint jobs, joins highest-paying open lobbies, or creates top-tier jobs."""
+    page = get(sess, "/ortak.php")
+    if inspect:
+        dump("inspect/ortak.html", page)
+
+    csrf = ""
+    m_csrf = (
+        re.search(r'data-csrf="([0-9a-f]{64})"', page)
+        or re.search(r'name="csrf_token"\s+value="([^"]+)"', page)
+        or re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', page)
+    )
+    if m_csrf:
+        csrf = m_csrf.group(1)
+
+    script_actions = set(re.findall(r'action\s*:\s*[\'"]([^\'"]+)[\'"]', page))
+
+    # 1. Collect completed joint jobs
+    collect_candidates = [a for a in script_actions if any(k in a for k in ("topla", "collect", "odul", "claim", "bitir", "finish"))]
+    collect_candidates += ["topla", "odul_topla", "collect_reward", "is_topla", "job_collect", "tamamla"]
+    for act in collect_candidates:
+        r = post(sess, "/ortak.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+        if isinstance(r, dict) and r.get("success"):
+            cyc.add("ortak", "collect earnings", True, msg(r))
+            break
+
+    # 2. Check if user already has an active job in progress or waiting
+    has_active = bool(
+        re.search(r'You have an active job', page, re.I)
+        or re.search(r'aktif\s+(?:bir\s+)?i(?:s|ş)iniz\s+var', page, re.I)
+        or re.search(r'badge[^>]*>\s*(?:Waiting|Bekliyor|Devam)\s*<', page, re.I)
+        or re.search(r'1 more people needed', page, re.I)
+    )
+
+    if has_active:
+        cyc.add("ortak", "status", True, "active joint job in progress/waiting for partner", soft=True)
+        return
+
+    # 3. Discover available open jobs to JOIN ("Jobs You Can Join")
+    join_candidates: List[Tuple[int, float, str]] = []
+    seen_ids = set()
+
+    for chunk in re.split(r'(?=<div[^>]*class=["\'][^"\']*(?:card|job|oda|item|slot))', page):
+        # Skip if requires level above current user (e.g. "Level 24 required")
+        if re.search(r'Level\s+(\d+)\s+required', chunk, re.I) or re.search(r'seviye\s+(\d+)\s+gerekli', chunk, re.I):
+            continue
+
+        id_m = (
+            re.search(r'data-(?:id|job-id|room-id|oda-id)=["\'](\d+)["\']', chunk)
+            or re.search(r'name=["\'](?:job|room|oda)_id["\']\s+value=["\'](\d+)["\']', chunk)
+            or re.search(r'onclick=["\'][^"\']*?(?:katil|join)[^\d]*(\d+)', chunk, re.I)
+        )
+        if not id_m:
+            continue
+        jid = int(id_m.group(1))
+        if jid in seen_ids:
+            continue
+        seen_ids.add(jid)
+
+        title_m = re.search(r'<h[3-6][^>]*>([^<]+)</h[3-6]>', chunk) or re.search(r'class=["\'][^"\']*title[^"\']*["\'][^>]*>([^<]+)<', chunk)
+        title = title_m.group(1).strip() if title_m else f"Job #{jid}"
+
+        # Extract payout quote
+        payout_m = (
+            re.search(r'If you join\s*<[^>]+>\s*\$([0-9,.]+)', chunk, re.I)
+            or re.search(r'Pool\s*<[^>]+>\s*\$([0-9,.]+)', chunk, re.I)
+            or re.search(r'\$([0-9,.]+)', chunk)
+        )
+        payout = 0.0
+        if payout_m:
+            try:
+                payout = float(payout_m.group(1).replace(",", "").replace(".", ""))
+            except ValueError:
+                payout = 0.0
+
+        join_candidates.append((jid, payout, title))
+
+    # Prioritize: highest payout open job first
+    join_candidates.sort(key=lambda x: x[1], reverse=True)
+
+    joined = False
+    join_actions = [a for a in script_actions if any(k in a for k in ("katil", "join", "gir"))]
+    join_actions += ["katil", "join", "oda_katil", "join_job"]
+
+    if join_candidates:
+        for jid, payout, title in join_candidates:
+            for act in join_actions:
+                r = post(
+                    sess,
+                    "/ortak.php",
+                    {"action": act, "id": str(jid), "job_id": str(jid), "oda_id": str(jid), "csrf_token": csrf, "ajax": "true", "ajax_request": 1},
+                    pause=False,
+                )
+                if isinstance(r, dict) and r.get("success"):
+                    label = f"${payout:,.0f}" if payout > 0 else "top quote"
+                    cyc.add("ortak", f"join {title} ({label})", True, msg(r))
+                    joined = True
+                    break
+                elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("enerji", "energy")):
+                    cyc.add("ortak", f"join {title}", True, msg(r), soft=True)
+                    joined = True
+                    break
+            if joined:
+                break
+
+    # 4. If no open job joined, create a top-tier job (e.g. Design Work)
+    if not joined:
+        create_actions = [a for a in script_actions if any(k in a for k in ("olustur", "create", "kur", "ac", "baslat"))]
+        create_actions += ["is_olustur", "create_job", "oda_olustur", "yeni_is"]
+
+        # Discover available job types in select/modal if present
+        type_options = re.findall(r'<option[^>]*value=["\']([^"\']+)["\'][^>]*>([^<]+)</option>', page)
+        target_type = None
+        for val, label in type_options:
+            if any(w in label.lower() for w in ("design", "tasarim", "photo", "fotograf")):
+                target_type = val
+                break
+        if not target_type and type_options:
+            target_type = type_options[0][0]
+
+        for act in create_actions:
+            payload = {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}
+            if target_type:
+                payload["job_type"] = str(target_type)
+                payload["is_tipi"] = str(target_type)
+                payload["type"] = str(target_type)
+            r = post(sess, "/ortak.php", payload, pause=False)
+            if isinstance(r, dict) and r.get("success"):
+                cyc.add("ortak", "create job", True, f"created room ({msg(r)})")
+                break
+            elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("enerji", "energy", "aktif", "active", "limit")):
+                cyc.add("ortak", "create job", True, msg(r), soft=True)
+                break
+        else:
+            cyc.add("ortak", "status", True, "checked open joint jobs", soft=True)
 
 
 # --------------------------------------------------------------------------- main
@@ -2210,10 +2351,14 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         section_tamir(sess, cyc, inspect)
     if "jobs" in sections:
         section_jobs(sess, cyc, inspect)
+    if "ortak" in sections:
+        section_ortak(sess, cyc, inspect)
     if "math" in sections:
         section_math(sess, cyc, inspect)
     if "jobs" in sections:
         section_jobs(sess, cyc, inspect)
+    if "ortak" in sections:
+        section_ortak(sess, cyc, inspect)
     if "tamir" in sections:
         section_tamir(sess, cyc, inspect)
     if "bank" in sections:
