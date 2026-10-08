@@ -28,7 +28,7 @@ on:
         default: false
       sections:
         description: "Comma separated sections to run"
-        default: "production,fields,orchards,barns,coops,bees,math,jobs"
+        default: "production,fields,orchards,barns,coops,bees,math,jobs,tamir,bank"
 
 permissions:
   contents: read
@@ -78,7 +78,7 @@ jobs:
         env:
           INPUTS: ${{ inputs.sections }}
         run: |
-          SECTIONS="${INPUTS:-production,fields,orchards,barns,coops,bees,math,jobs}"
+          SECTIONS="${INPUTS:-production,fields,orchards,barns,coops,bees,math,jobs,tamir,bank}"
           echo "sections=$SECTIONS" >> "$GITHUB_OUTPUT"
           echo "running sections: $SECTIONS"
 
@@ -87,6 +87,9 @@ jobs:
           TICARISK_USER: ${{ secrets.TICARISK_USER }}
           TICARISK_PASS: ${{ secrets.TICARISK_PASS }}
           TICARISK_SECTIONS: ${{ steps.pick.outputs.sections }}
+          TICARISK_BANK_DEPOSIT: ${{ vars.TICARISK_BANK_DEPOSIT || '1' }}
+          TICARISK_BANK_RESERVE: ${{ vars.TICARISK_BANK_RESERVE || '500000' }}
+          TICARISK_BANK_WITHDRAW: ${{ vars.TICARISK_BANK_WITHDRAW || '1' }}
           TICARISK_CROP_ID: ${{ vars.TICARISK_CROP_ID || '4' }}
           TICARISK_CROP_ROTATION: ${{ vars.TICARISK_CROP_ROTATION || '1' }}
           TICARISK_ROTATION_FILE: ${{ vars.TICARISK_ROTATION_FILE || 'crop_rotation.json' }}

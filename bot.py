@@ -56,7 +56,12 @@ BASE = os.environ.get("TICARISK_BASE", "https://www.ticarisk.com").rstrip("/")
 USER = os.environ.get("TICARISK_USER", "")
 PASSWORD = os.environ.get("TICARISK_PASS", "")
 
-DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math,jobs"
+DEFAULT_SECTIONS = "production,fields,orchards,barns,coops,bees,math,jobs,tamir,bank"
+
+# Bank 2% Daily Interest (bank.php)
+BANK_AUTO_DEPOSIT = os.environ.get("TICARISK_BANK_DEPOSIT", "1") == "1"
+BANK_RESERVE = float(os.environ.get("TICARISK_BANK_RESERVE", "500000"))  # keep $500k working capital
+BANK_AUTO_WITHDRAW = os.environ.get("TICARISK_BANK_WITHDRAW", "1") == "1"
 
 # Math game (matematik.php). Each question is a PNG, so this section shells out
 # to the tesseract binary; without it, the section reports itself skipped.
@@ -1994,6 +1999,143 @@ def section_jobs(sess, cyc: Cycle, inspect: bool) -> None:
                 break
 
 
+# --------------------------------------------------------------------------- auto repair (tamir.php)
+
+
+def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
+    """Auto Repair Workshop (tamir.php): calls customers, assigns repairs, and collects completed revenue."""
+    page = get(sess, "/tamir.php")
+    if inspect:
+        dump("inspect/tamir.html", page)
+
+    csrf = ""
+    m_csrf = (
+        re.search(r'data-csrf="([0-9a-f]{64})"', page)
+        or re.search(r'name="csrf_token"\s+value="([^"]+)"', page)
+        or re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', page)
+    )
+    if m_csrf:
+        csrf = m_csrf.group(1)
+
+    script_actions = set(re.findall(r'action\s*:\s*[\'"]([^\'"]+)[\'"]', page))
+
+    # 1. Collect / Deliver finished repairs
+    collect_candidates = [a for a in script_actions if any(k in a for k in ("teslim", "collect", "tamamla", "finish", "deliver"))]
+    collect_candidates += ["tamir_tamamla", "teslim_et", "collect_repair", "tamir_bitir", "complete_repair"]
+    for act in collect_candidates:
+        r = post(sess, "/tamir.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+        if isinstance(r, dict) and r.get("success"):
+            cyc.add("tamir", "deliver finished repairs", True, msg(r))
+            break
+
+    # Discover customer/repair IDs on page
+    repair_ids = sorted(
+        set(
+            re.findall(r'data-repair(?:-id)?="(\d+)"', page)
+            + re.findall(r'data-customer(?:-id)?="(\d+)"', page)
+            + re.findall(r'data-musteri(?:-id)?="(\d+)"', page)
+            + re.findall(r'name="repair_id"\s+value="(\d+)"', page)
+        ),
+        key=int,
+    )
+
+    # 2. Start / Accept repairs for waiting customers
+    start_candidates = [a for a in script_actions if any(k in a for k in ("baslat", "start", "accept", "tamire_al"))]
+    start_candidates += ["tamir_baslat", "tamire_al", "start_repair", "accept_customer"]
+    started = False
+    for act in start_candidates:
+        r = post(sess, "/tamir.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+        if isinstance(r, dict) and r.get("success"):
+            cyc.add("tamir", "start repairs", True, msg(r))
+            started = True
+            break
+
+    if not started and repair_ids:
+        for rid in repair_ids:
+            r = post(sess, "/tamir.php", {"action": "tamire_al", "repair_id": str(rid), "customer_id": str(rid), "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+            if isinstance(r, dict) and r.get("success"):
+                cyc.add("tamir", f"start repair {rid}", True, msg(r))
+
+    # 3. Call New Customers ("+ Call new customer")
+    call_candidates = [a for a in script_actions if any(k in a for k in ("musteri", "call", "customer"))]
+    call_candidates += ["musteri_cagir", "call_customer", "new_customer", "call_new_customer"]
+    called = False
+    for act in call_candidates:
+        r = post(sess, "/tamir.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+        if isinstance(r, dict) and r.get("success"):
+            cyc.add("tamir", "call new customer", True, msg(r))
+            called = True
+            break
+        elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "limit", "bekle", "max")):
+            cyc.add("tamir", "customer slots", True, msg(r), soft=True)
+            called = True
+            break
+    if not called:
+        cyc.add("tamir", "call customer", True, "workshop slots checked", soft=True)
+
+
+# --------------------------------------------------------------------------- bank (bank.php)
+
+
+def section_bank(sess, cyc: Cycle, inspect: bool) -> None:
+    """Bank (bank.php): earns 2% daily interest on deposits up to $30M, withdrawing at maturity and compounding."""
+    page = get(sess, "/bank.php")
+    if inspect:
+        dump("inspect/bank.html", page)
+
+    csrf = ""
+    m_csrf = (
+        re.search(r'data-csrf="([0-9a-f]{64})"', page)
+        or re.search(r'name="csrf_token"\s+value="([^"]+)"', page)
+        or re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', page)
+    )
+    if m_csrf:
+        csrf = m_csrf.group(1)
+
+    # 1. Check if a mature deposit can be withdrawn with 2% interest
+    if BANK_AUTO_WITHDRAW:
+        for act in ("withdraw", "para_cek", "cek", "withdraw_deposit"):
+            r = post(sess, "/bank.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+            if isinstance(r, dict) and r.get("success"):
+                cyc.add("bank", "withdraw matured deposit", True, f"collected with 2% interest! ({msg(r)})")
+                break
+            elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("sure", "vade", "bekle", "yok", "maturity")):
+                break
+
+    # 2. Deposit idle cash to earn 2% daily interest (up to $30M cap, keeping reserve liquidity)
+    if BANK_AUTO_DEPOSIT:
+        bal = balance(sess) or 0.0
+        m_dep = re.search(r'Total\s+Deposited\s*<[^>]+>\s*\$([0-9,.]+)', page, re.I)
+        currently_deposited = 0.0
+        if m_dep:
+            try:
+                currently_deposited = float(m_dep.group(1).replace(",", "").replace(".", ""))
+            except ValueError:
+                pass
+
+        if bal > BANK_RESERVE and currently_deposited < 30000000:
+            deposit_amt = int(min(bal - BANK_RESERVE, 30000000 - currently_deposited))
+            if deposit_amt >= 100000:
+                deposited = False
+                for act in ("deposit", "para_yatir", "yatir", "add_deposit"):
+                    r = post(
+                        sess,
+                        "/bank.php",
+                        {"action": act, "amount": str(deposit_amt), "miktar": str(deposit_amt), "csrf_token": csrf, "ajax": "true", "ajax_request": 1},
+                        pause=False,
+                    )
+                    if isinstance(r, dict) and r.get("success"):
+                        cyc.add("bank", "deposit", True, f"locked ${deposit_amt:,} earning 2% daily interest ({msg(r)})")
+                        deposited = True
+                        break
+                    elif isinstance(r, dict) and "limit" in str(msg(r)).lower():
+                        cyc.add("bank", "deposit", True, msg(r), soft=True)
+                        deposited = True
+                        break
+                if not deposited:
+                    cyc.add("bank", "deposit", True, f"eligible ${deposit_amt:,} (reserve kept ${BANK_RESERVE:,.0f})", soft=True)
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -2022,6 +2164,10 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         section_math(sess, cyc, inspect)
     if "jobs" in sections:
         section_jobs(sess, cyc, inspect)
+    if "tamir" in sections:
+        section_tamir(sess, cyc, inspect)
+    if "bank" in sections:
+        section_bank(sess, cyc, inspect)
 
     if inspect:
         pages_to_dump = [
