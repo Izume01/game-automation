@@ -2227,6 +2227,7 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
             ("lojistik", "/lojistik.php?sekme=gorevler"),
             ("bank", "/bank.php"),
             ("balikcilik", "/balikcilik.php"),
+            ("isyeri", "/isyeri.php"),
         ]
         for name, uri in pages_to_dump:
             try:
