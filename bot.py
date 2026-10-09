@@ -279,7 +279,16 @@ def post(
     try:
         return r.json()
     except ValueError:
-        return {"success": False, "message": r.text[:200]}
+        txt = r.text or ""
+        m_json = re.search(r'(\{[\s\S]*"(?:success|status|message)"[\s\S]*\})', txt)
+        if m_json:
+            try:
+                return json.loads(m_json.group(1))
+            except Exception:
+                pass
+        if any(w in txt.lower() for w in ("başarıyla", "basariyla", "çağrıldı", "cagirildi", "yükseltildi", "yukseltildi", "alındı", "alindi", "katıldınız", "katildiniz", "oluşturuldu", "olusturuldu", "successfully", "success")):
+            return {"success": True, "message": "completed successfully"}
+        return {"success": False, "message": txt[:200]}
 
 
 # Server messages that mean "nothing to do right now", not a malfunction.
@@ -2010,7 +2019,7 @@ def section_jobs(sess, cyc: Cycle, inspect: bool) -> None:
 
 
 def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
-    """Auto Repair Workshop (tamir.php): calls customers, assigns repairs, and collects completed revenue."""
+    """Auto Repair Workshop (tamir.php): upgrades workshop, calls customers, assigns highest-paying repairs, and collects completed revenue."""
     page = get(sess, "/tamir.php")
     if inspect:
         dump("inspect/tamir.html", page)
@@ -2026,20 +2035,44 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
 
     script_actions = set(re.findall(r'action\s*:\s*[\'"]([^\'"]+)[\'"]', page))
 
-    # 1. Collect / Deliver finished repairs
+    # 1. UPGRADE WORKSHOP (Level 1 Starter -> Level 2 Advanced -> Level 3 Master)
+    m_up_cost = re.search(r'(?:Upgrade|Y[uü]kselt|Geli[sş]tir)[^\d]*([0-9,.]+)\s*(?:\$|TL)?', page, re.I)
+    up_cost = 25000.0
+    if m_up_cost:
+        try:
+            raw_c = m_up_cost.group(1).replace(",", "").replace(".", "")
+            up_cost = float(raw_c)
+        except ValueError:
+            up_cost = 25000.0
+
+    bal = balance(sess) or 0.0
+    # Upgrade if balance exceeds cost plus the $500k reserve buffer
+    if bal > (BANK_RESERVE + up_cost):
+        up_actions = [a for a in script_actions if any(k in a for k in ("upgrade", "yukselt", "gelistir", "level"))]
+        up_actions += ["atolye_yukselt", "atolye_gelistir", "upgrade", "upgrade_workshop", "atolyeyi_gelistir", "seviye_yukselt", "atolye_seviye_yukselt"]
+        for act in up_actions:
+            r = post(sess, "/tamir.php", {"action": act, act: 1, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+            if isinstance(r, dict) and r.get("success"):
+                cyc.add("tamir", "upgrade workshop", True, f"upgraded to higher tier! (${up_cost:,.0f} spent) ({msg(r)})")
+                page = get(sess, "/tamir.php")
+                break
+            elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("max", "son seviye", "en yuksek")):
+                break
+
+    # 2. DELIVER / COLLECT COMPLETED REPAIRS
     collect_candidates = [a for a in script_actions if any(k in a for k in ("teslim", "collect", "tamamla", "finish", "deliver"))]
-    collect_candidates += ["tamir_tamamla", "teslim_et", "collect_repair", "tamir_bitir", "complete_repair"]
+    collect_candidates += ["tamir_tamamla", "teslim_et", "tamir_teslim", "collect_repair", "tamir_bitir", "complete_repair", "ucret_al"]
     for act in collect_candidates:
-        r = post(sess, "/tamir.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+        r = post(sess, "/tamir.php", {"action": act, act: 1, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
         if isinstance(r, dict) and r.get("success"):
             cyc.add("tamir", "deliver finished repairs", True, msg(r))
             break
 
-    # Discover waiting customers and their quoted payouts
+    # 3. DISCOVER WAITING CUSTOMERS AND HIGHEST QUOTED PAYOUTS
     candidates: List[Tuple[int, float]] = []
     seen_ids = set()
 
-    for chunk in re.split(r'(?=<div[^>]*class=["\'][^"\']*(?:card|customer|musteri|item|repair|slot))', page):
+    for chunk in re.split(r'(?=<div[^>]*class=["\'][^"\']*(?:card|customer|musteri|item|repair|slot|col|p-))', page):
         id_m = (
             re.search(r'data-(?:id|repair-id|customer-id|musteri-id)=["\'](\d+)["\']', chunk)
             or re.search(r'name=["\'](?:repair|customer|musteri)_id["\']\s+value=["\'](\d+)["\']', chunk)
@@ -2089,28 +2122,52 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
     # PRIORITIZE: Sort waiting customers by HIGHEST paying repair first
     candidates.sort(key=lambda x: x[1], reverse=True)
 
-    # 2. Start / Accept highest-paying repairs first into open bays
+    # Start / Accept highest-paying repairs first into open bays
     if candidates:
+        start_actions = [a for a in script_actions if any(k in a for k in ("tamire_al", "tamir_baslat", "accept", "start"))]
+        start_actions += ["tamire_al", "tamir_baslat", "accept_repair", "start_repair", "accept_customer", "tamir_et"]
         for rid, price in candidates:
-            r = post(sess, "/tamir.php", {"action": "tamire_al", "repair_id": str(rid), "customer_id": str(rid), "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
-            if isinstance(r, dict) and r.get("success"):
-                label = f"${price:,.0f}" if price > 0 else "top quote"
-                cyc.add("tamir", f"start repair {rid} ({label})", True, msg(r))
-            elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "slot", "kapasite", "full", "max")):
-                cyc.add("tamir", f"repair bays full (holding lower-paying jobs)", True, msg(r), soft=True)
+            started = False
+            for act in start_actions:
+                r = post(
+                    sess,
+                    "/tamir.php",
+                    {
+                        "action": act,
+                        act: 1,
+                        "repair_id": str(rid),
+                        "customer_id": str(rid),
+                        "musteri_id": str(rid),
+                        "id": str(rid),
+                        "csrf_token": csrf,
+                        "ajax": "true",
+                        "ajax_request": 1,
+                    },
+                    pause=False,
+                )
+                if isinstance(r, dict) and r.get("success"):
+                    label = f"${price:,.0f}" if price > 0 else "top quote"
+                    cyc.add("tamir", f"start repair {rid} ({label})", True, msg(r))
+                    started = True
+                    break
+                elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "slot", "kapasite", "full", "max")):
+                    cyc.add("tamir", "repair bays full (all slots working)", True, msg(r), soft=True)
+                    started = True
+                    break
+            if started and isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "slot", "kapasite", "full", "max")):
                 break
 
-    # 3. Call New Customers ("+ Call new customer")
+    # 4. CALL NEW CUSTOMERS ("+ Call new customer")
     call_candidates = [a for a in script_actions if any(k in a for k in ("musteri", "call", "customer"))]
-    call_candidates += ["musteri_cagir", "call_customer", "new_customer", "call_new_customer"]
+    call_candidates += ["musteri_cagir", "call_customer", "yeni_musteri", "call_new_customer", "yeni_musteri_cagir", "musteri_bul"]
     called = False
     for act in call_candidates:
-        r = post(sess, "/tamir.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
+        r = post(sess, "/tamir.php", {"action": act, act: 1, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
         if isinstance(r, dict) and r.get("success"):
             cyc.add("tamir", "call new customer", True, msg(r))
             called = True
             break
-        elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "limit", "bekle", "max", "dakika", "saniye", "cooldown")):
+        elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("dolu", "limit", "bekle", "max", "dakika", "saniye", "cooldown", "sure")):
             cyc.add("tamir", "customer cooldown", True, msg(r), soft=True)
             called = True
             break
@@ -2185,7 +2242,7 @@ def section_bank(sess, cyc: Cycle, inspect: bool) -> None:
 
 
 def section_ortak(sess, cyc: Cycle, inspect: bool) -> None:
-    """Joint Jobs (ortak.php): collects completed joint jobs, joins highest-paying open lobbies, or creates top-tier jobs."""
+    """Joint Jobs (ortak.php): manages joint jobs, joining highest-paying lobbies or hosting Design Work."""
     page = get(sess, "/ortak.php")
     if inspect:
         dump("inspect/ortak.html", page)
@@ -2201,33 +2258,49 @@ def section_ortak(sess, cyc: Cycle, inspect: bool) -> None:
 
     script_actions = set(re.findall(r'action\s*:\s*[\'"]([^\'"]+)[\'"]', page))
 
-    # 1. Collect completed joint jobs
-    collect_candidates = [a for a in script_actions if any(k in a for k in ("topla", "collect", "odul", "claim", "bitir", "finish"))]
-    collect_candidates += ["topla", "odul_topla", "collect_reward", "is_topla", "job_collect", "tamamla"]
-    for act in collect_candidates:
-        r = post(sess, "/ortak.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
-        if isinstance(r, dict) and r.get("success"):
-            cyc.add("ortak", "collect earnings", True, msg(r))
-            break
+    # 1. CANCEL STUCK WAITING ROOMS
+    # If the user has a waiting room (1 more people needed) that nobody joined:
+    # Cancel it so we are free to join active open lobbies that start immediately!
+    stuck_waiting = bool(
+        re.search(r'1 more people needed', page, re.I)
+        or re.search(r'badge[^>]*>\s*(?:Waiting|Bekliyor)\s*<', page, re.I)
+    )
+    if stuck_waiting:
+        cancel_actions = [a for a in script_actions if any(k in a for k in ("iptal", "cancel"))]
+        cancel_actions += ["iptal", "cancel", "is_iptal", "oda_iptal", "job_cancel"]
 
-    # 2. Check if user already has an active job in progress or waiting
-    has_active = bool(
+        cancel_id_m = (
+            re.search(r'data-(?:id|job-id|room-id)=["\'](\d+)["\'][^>]*>(?:[^<]*Cancel|[^<]*İptal)', page, re.I)
+            or re.search(r'onclick=["\'][^"\']*?(?:cancel|iptal)[^\d]*(\d+)', page, re.I)
+            or re.search(r'data-id=["\'](\d+)["\']', page)
+        )
+        cid = cancel_id_m.group(1) if cancel_id_m else ""
+        for act in cancel_actions:
+            payload = {"action": act, act: 1, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}
+            if cid:
+                payload.update({"id": cid, "job_id": cid, "oda_id": cid, "room_id": cid})
+            r = post(sess, "/ortak.php", payload, pause=False)
+            if isinstance(r, dict) and r.get("success"):
+                cyc.add("ortak", "cancel stuck room", True, f"freed slot to join active lobbies ({msg(r)})")
+                page = get(sess, "/ortak.php")
+                break
+
+    # 2. Check if a job is actively working in progress (2/2 people countdown)
+    in_progress = bool(
         re.search(r'You have an active job', page, re.I)
         or re.search(r'aktif\s+(?:bir\s+)?i(?:s|ş)iniz\s+var', page, re.I)
-        or re.search(r'badge[^>]*>\s*(?:Waiting|Bekliyor|Devam)\s*<', page, re.I)
-        or re.search(r'1 more people needed', page, re.I)
+        or re.search(r'badge[^>]*>\s*(?:In Progress|Devam Ediyor)\s*<', page, re.I)
     )
-
-    if has_active:
-        cyc.add("ortak", "status", True, "active joint job in progress/waiting for partner", soft=True)
+    if in_progress:
+        cyc.add("ortak", "status", True, "active joint job running (finishes in ~15-25 min)", soft=True)
         return
 
-    # 3. Discover available open jobs to JOIN ("Jobs You Can Join")
+    # 3. DISCOVER JOINABLE JOBS ON "Active Jobs" TAB
     join_candidates: List[Tuple[int, float, str]] = []
     seen_ids = set()
 
-    for chunk in re.split(r'(?=<div[^>]*class=["\'][^"\']*(?:card|job|oda|item|slot))', page):
-        # Skip if requires level above current user (e.g. "Level 24 required")
+    for chunk in re.split(r'(?=<div[^>]*class=["\'][^"\']*(?:card|job|oda|item|slot|col|p-|rounded))', page):
+        # Skip if locked by high player level (e.g. Level 24 required)
         if re.search(r'Level\s+(\d+)\s+required', chunk, re.I) or re.search(r'seviye\s+(\d+)\s+gerekli', chunk, re.I):
             continue
 
@@ -2261,12 +2334,12 @@ def section_ortak(sess, cyc: Cycle, inspect: bool) -> None:
 
         join_candidates.append((jid, payout, title))
 
-    # Prioritize: highest payout open job first
+    # Prioritize: highest payout open job first (Design Work $94k > Plumbing $43k > Photography $50k)
     join_candidates.sort(key=lambda x: x[1], reverse=True)
 
     joined = False
     join_actions = [a for a in script_actions if any(k in a for k in ("katil", "join", "gir"))]
-    join_actions += ["katil", "join", "oda_katil", "join_job"]
+    join_actions += ["katil", "join", "oda_katil", "join_job", "is_katil", "birlikte_yap"]
 
     if join_candidates:
         for jid, payout, title in join_candidates:
@@ -2274,12 +2347,22 @@ def section_ortak(sess, cyc: Cycle, inspect: bool) -> None:
                 r = post(
                     sess,
                     "/ortak.php",
-                    {"action": act, "id": str(jid), "job_id": str(jid), "oda_id": str(jid), "csrf_token": csrf, "ajax": "true", "ajax_request": 1},
+                    {
+                        "action": act,
+                        act: 1,
+                        "id": str(jid),
+                        "job_id": str(jid),
+                        "oda_id": str(jid),
+                        "room_id": str(jid),
+                        "csrf_token": csrf,
+                        "ajax": "true",
+                        "ajax_request": 1,
+                    },
                     pause=False,
                 )
                 if isinstance(r, dict) and r.get("success"):
-                    label = f"${payout:,.0f}" if payout > 0 else "top quote"
-                    cyc.add("ortak", f"join {title} ({label})", True, msg(r))
+                    label = f"${payout:,.0f}" if payout > 0 else "top payout"
+                    cyc.add("ortak", f"join {title} ({label})", True, f"started job! ({msg(r)})")
                     joined = True
                     break
                 elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("enerji", "energy")):
@@ -2289,33 +2372,35 @@ def section_ortak(sess, cyc: Cycle, inspect: bool) -> None:
             if joined:
                 break
 
-    # 4. If no open job joined, create a top-tier job (e.g. Design Work)
+    # 4. IF NO OPEN JOB JOINED, CREATE A TOP-TIER JOB (Design Work / Photography)
     if not joined:
         create_actions = [a for a in script_actions if any(k in a for k in ("olustur", "create", "kur", "ac", "baslat"))]
-        create_actions += ["is_olustur", "create_job", "oda_olustur", "yeni_is"]
+        create_actions += ["is_olustur", "create_job", "oda_olustur", "yeni_is", "olustur", "create"]
 
-        # Discover available job types in select/modal if present
-        type_options = re.findall(r'<option[^>]*value=["\']([^"\']+)["\'][^>]*>([^<]+)</option>', page)
-        target_type = None
-        for val, label in type_options:
-            if any(w in label.lower() for w in ("design", "tasarim", "photo", "fotograf")):
-                target_type = val
-                break
-        if not target_type and type_options:
-            target_type = type_options[0][0]
-
-        for act in create_actions:
-            payload = {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}
-            if target_type:
-                payload["job_type"] = str(target_type)
-                payload["is_tipi"] = str(target_type)
-                payload["type"] = str(target_type)
-            r = post(sess, "/ortak.php", payload, pause=False)
-            if isinstance(r, dict) and r.get("success"):
-                cyc.add("ortak", "create job", True, f"created room ({msg(r)})")
-                break
-            elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("enerji", "energy", "aktif", "active", "limit")):
-                cyc.add("ortak", "create job", True, msg(r), soft=True)
+        preferred_types = ["design", "tasarim", "photography", "fotograf", "plumbing", "tesisat"]
+        for jtype in preferred_types:
+            for act in create_actions:
+                payload = {
+                    "action": act,
+                    act: 1,
+                    "job_type": jtype,
+                    "is_tipi": jtype,
+                    "type": jtype,
+                    "gorev_tipi": jtype,
+                    "csrf_token": csrf,
+                    "ajax": "true",
+                    "ajax_request": 1,
+                }
+                r = post(sess, "/ortak.php", payload, pause=False)
+                if isinstance(r, dict) and r.get("success"):
+                    cyc.add("ortak", f"create {jtype.capitalize()} job", True, f"created room! ({msg(r)})")
+                    joined = True
+                    break
+                elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("enerji", "energy", "aktif", "active", "limit")):
+                    cyc.add("ortak", "create job", True, msg(r), soft=True)
+                    joined = True
+                    break
+            if joined:
                 break
         else:
             cyc.add("ortak", "status", True, "checked open joint jobs", soft=True)
