@@ -93,7 +93,7 @@ jobs:
           TICARISK_CROP_ID: ${{ vars.TICARISK_CROP_ID || '3' }}
           TICARISK_CROP_ROTATION: ${{ vars.TICARISK_CROP_ROTATION || '1' }}
           TICARISK_ROTATION_MODE: ${{ vars.TICARISK_ROTATION_MODE || 'daily' }}
-          TICARISK_DAILY_CROPS: ${{ vars.TICARISK_DAILY_CROPS || '3,5,4,1' }}
+          TICARISK_DAILY_CROPS: ${{ vars.TICARISK_DAILY_CROPS || '3,5,1,7,6' }}
           TICARISK_ROTATION_FILE: ${{ vars.TICARISK_ROTATION_FILE || 'crop_rotation.json' }}
           # fields replant only after a harvest; 150 L x $120 = $18,000, and
           # MAX_WATER_SPEND hard-caps it so a bad loop can't drain the balance

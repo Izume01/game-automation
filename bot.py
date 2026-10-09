@@ -83,17 +83,15 @@ CAPTCHA_GUESSES = int(os.environ.get("TICARISK_CAPTCHA_GUESSES", "4"))
 CAPTCHA_ROUNDS = int(os.environ.get("TICARISK_CAPTCHA_ROUNDS", "4"))
 CAPTCHA_MAX_GATES = int(os.environ.get("TICARISK_CAPTCHA_MAX_GATES", "60"))
 
-# 4 = Potato (6 h), 1 = Wheat (4 h). Fallback seed and the crop used when
-# rotation is off. The live list is read from the page's bulk-plant select.
-CROP_ID = int(os.environ.get("TICARISK_CROP_ID", "4"))
+# 3 = Tomato (4 h), 5 = Carrot (4 h), 1 = Wheat (4 h), 7 = Cotton (7 h), 6 = Strawberry (6 h).
+# Fallback seed when rotation is off.
+CROP_ID = int(os.environ.get("TICARISK_CROP_ID", "3"))
 
-# Bulk-plant rotation.
-# "daily" = dedicates 1 full calendar day to each crop in rotation (Tomato -> Carrot -> Potato -> Wheat)
-# "cycle" = steps forward to the next crop on every planting cycle
+# Bulk-plant rotation: Tomato -> Carrot -> Wheat -> Cotton -> Strawberry (Potato removed).
 CROP_ROTATION_MODE = os.environ.get("TICARISK_ROTATION_MODE", "daily")
 CROP_DAILY_LIST = [
     int(x.strip())
-    for x in os.environ.get("TICARISK_DAILY_CROPS", "3,5,4,1").split(",")
+    for x in os.environ.get("TICARISK_DAILY_CROPS", "3,5,1,7,6").split(",")
     if x.strip().isdigit()
 ]
 CROP_ROTATION = os.environ.get("TICARISK_CROP_ROTATION", "1") == "1"
