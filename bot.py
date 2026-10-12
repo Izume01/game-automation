@@ -106,8 +106,8 @@ PETEK_REFILL = os.environ.get("TICARISK_PETEK_REFILL", "1") == "1"
 PETEK_MAX_SPEND = float(os.environ.get("TICARISK_PETEK_MAX_SPEND", "60000"))
 PETEK_PRICE = 1500
 
-# Never bought unless > 0. One field needs 150 L at $120/L = $18,000.
-BUY_WATER_LITERS = int(os.environ.get("TICARISK_BUY_WATER_LITERS", "0"))
+# Water defaults to 2000 L to safely support full 11-field farm (11 x 150 L = 1650 L)
+BUY_WATER_LITERS = int(os.environ.get("TICARISK_BUY_WATER_LITERS", "2000"))
 MAX_WATER_SPEND = float(os.environ.get("TICARISK_MAX_WATER_SPEND", "0"))  # 0 = no cap
 
 # Raw materials that stall a business when they run dry. Format, comma
@@ -126,7 +126,7 @@ MAX_WATER_DAY = float(os.environ.get("TICARISK_MAX_WATER_DAY", "1000000"))
 # 200 L a cycle to make the Cyanide/Acid that unblocks the gold mine, and the
 # concrete plant needs 62 L. Top the tank up on its own schedule, not only
 # when a field happens to fail.
-WATER_TRIGGER = int(os.environ.get("TICARISK_WATER_TRIGGER", "1000"))
+WATER_TRIGGER = int(os.environ.get("TICARISK_WATER_TRIGGER", "2000"))
 RESTOCK_LEDGER = os.environ.get("TICARISK_RESTOCK_LEDGER", "restock_spend.json")
 
 def _parse_restock(raw: str) -> List[Tuple[str, int, float]]:
@@ -407,7 +407,7 @@ def crop_options(html: str) -> Dict[int, str]:
             continue
         out: Dict[int, str] = {}
         for i, raw in re.findall(r'<option value="(\d+)"[^>]*>\s*([^<]+)', box.group(0)):
-            name = re.split(r"\s*\(", raw, 1)[0].strip()
+            name = re.split(r"\s*\(", raw, maxsplit=1)[0].strip()
             if name:
                 out[int(i)] = name
         if out:
@@ -659,7 +659,12 @@ def section_fields(sess, cyc: Cycle, inspect: bool) -> None:
 
     res = plant(crop)
     if not ok(res) and "water" in msg(res).lower():
-        if _maybe_buy_water(sess, cyc):
+        needed = 0
+        m_req = re.search(r"required:\s*(\d+)", msg(res), re.I)
+        m_avail = re.search(r"available:\s*(\d+)", msg(res), re.I)
+        if m_req and m_avail:
+            needed = max(0, int(m_req.group(1)) - int(m_avail.group(1))) + 500
+        if _maybe_buy_water(sess, cyc, needed=needed):
             res = plant(crop)
 
     cyc.add("fields", f"plant {label} on {len(empty)} ({why})", ok(res), msg(res))
@@ -814,10 +819,12 @@ def _buy_material(
     return good
 
 
-def _maybe_buy_water(sess, cyc: Cycle) -> bool:
-    if BUY_WATER_LITERS <= 0:
-        cyc.add("fields", "buy water", True, "skipped (TICARISK_BUY_WATER_LITERS=0)")
-        return False
+def _maybe_buy_water(sess, cyc: Cycle, needed: int = 0) -> bool:
+    want = BUY_WATER_LITERS
+    if needed > 0:
+        want = max(want, needed)
+    if want <= 0:
+        want = 2000
     spent = _ledger().get("water", 0.0)
     if MAX_WATER_DAY > 0 and spent >= MAX_WATER_DAY:
         cyc.add(
@@ -828,7 +835,7 @@ def _maybe_buy_water(sess, cyc: Cycle) -> bool:
         )
         return False
     return _buy_material(
-        sess, cyc, "fields", "su", BUY_WATER_LITERS,
+        sess, cyc, "fields", "su", want,
         min(MAX_WATER_SPEND, MAX_WATER_DAY - spent) if MAX_WATER_DAY > 0 else MAX_WATER_SPEND,
         ledger_key="water",
     )
