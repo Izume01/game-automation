@@ -1682,7 +1682,7 @@ def _clean_image(path: str) -> Optional[str]:
                             visited[ny, nx] = True
                             q.append((ny, nx))
                             comp.append((ny, nx))
-                if len(comp) >= 18:
+                if len(comp) >= 10:
                     for cy, cx in comp:
                         clean_fg[cy, cx] = True
 
@@ -2033,8 +2033,41 @@ def section_jobs(sess, cyc: Cycle, inspect: bool) -> None:
 # --------------------------------------------------------------------------- auto repair (tamir.php)
 
 
+def _tamir_candidates(page: str) -> List[Tuple[int, float]]:
+    candidates: List[Tuple[int, float]] = []
+    seen = set()
+    for chunk in re.split(r'(?=<div[^>]*class=["\'][^"\']*(?:t-card customer|customer-card|card customer))', page):
+        id_m = (
+            re.search(r'showRepairDetailModal\((\d+)', chunk)
+            or re.search(r'confirmReject\((\d+)', chunk)
+            or re.search(r'data-(?:id|customer-id|musteri-id)=["\'](\d+)["\']', chunk)
+        )
+        if not id_m:
+            continue
+        cid = int(id_m.group(1))
+        if cid in seen:
+            continue
+        seen.add(cid)
+        prices = [
+            float(p.replace(",", "").replace(".", ""))
+            for p in re.findall(r'\$([0-9,.]+)', chunk)
+            if p.replace(",", "").replace(".", "").isdigit()
+        ]
+        top_p = max(prices) if prices else 0.0
+        candidates.append((cid, top_p))
+
+    for cid_s in re.findall(r'showRepairDetailModal\((\d+)', page):
+        cid = int(cid_s)
+        if cid not in seen:
+            candidates.append((cid, 0.0))
+            seen.add(cid)
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates
+
+
 def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
-    """Auto Repair Workshop (tamir.php): delivers finished repairs, accepts highest-paying customers, and calls new customers with captcha."""
+    """Auto Repair Workshop (tamir.php): delivers finished repairs, fills all open workshop bays with customers, and calls new customers as needed."""
     page = get(sess, "/tamir.php")
     if inspect:
         dump("inspect/tamir.html", page)
@@ -2051,100 +2084,79 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
     # 1. DELIVER / COLLECT COMPLETED REPAIRS
     completed_rids = set(
         re.findall(r'collectRepairIncome\((\d+)\)', page)
-        + re.findall(r'collectIncomeTamir\((\d+)\)', page)
-        + re.findall(r'data-repair-id=["\'](\d+)["\']', page)
-        + re.findall(r'repair_id["\']?\s*:\s*["\']?(\d+)', page)
+        + re.findall(r'onclick=["\']collectRepairIncome\((\d+)\)["\']', page)
     )
     for rid in sorted(completed_rids, key=int):
         r_col = post(sess, "/collect_income_tamir.php", {"csrf_token": csrf, "repair_id": str(rid)}, pause=False)
         if isinstance(r_col, dict) and r_col.get("success"):
-            cyc.add("tamir", f"deliver car {rid}", True, f"delivered & credited! ({msg(r_col)})")
-        elif isinstance(r_col, dict) and "repair" in str(msg(r_col)).lower():
-            break
+            cyc.add("tamir", f"deliver repair {rid}", True, msg(r_col))
+        elif isinstance(r_col, dict):
+            log.debug("collect_income_tamir for %s: %s", rid, msg(r_col))
 
-    # 2. DISCOVER WAITING CUSTOMERS AND HIGHEST QUOTED PAYOUTS
-    candidates: List[Tuple[int, float]] = []
-    seen_ids = set()
+    # 2. CHECK WORKSHOP CAPACITY AND ACTIVE REPAIRS
+    page = get(sess, "/tamir.php")
+    m_slots = re.search(r'(\d+)\s+slots', page, re.I)
+    total_slots = int(m_slots.group(1)) if m_slots else 6
+    active_rids = re.findall(r'id=["\']repair-card-(\d+)["\']', page)
+    active_count = len(active_rids)
+    open_slots = max(0, total_slots - active_count)
+    log.info("tamir: %d/%d bays active, %d open slots", active_count, total_slots, open_slots)
 
-    for chunk in re.split(r'(?=<div[^>]*class=["\'][^"\']*(?:t-card customer|customer-card|card customer))', page):
-        id_m = (
-            re.search(r'showRepairDetailModal\((\d+)', chunk)
-            or re.search(r'data-(?:id|customer-id|musteri-id)=["\'](\d+)["\']', chunk)
-            or re.search(r'name=["\']customer_id["\']\s+value=["\'](\d+)["\']', chunk)
-        )
-        if not id_m:
-            continue
-        cid = int(id_m.group(1))
-        if cid in seen_ids:
-            continue
-        seen_ids.add(cid)
+    if open_slots <= 0:
+        cyc.add("tamir", "workshop status", True, f"all {total_slots} bays working at 100% capacity", soft=True)
+        return
 
-        # Extract quote prices
-        prices = [
-            float(p.replace(",", "").replace(".", ""))
-            for p in re.findall(r'\$([0-9,.]+)', chunk)
-            if p.replace(",", "").replace(".", "").isdigit()
-        ]
-        top_p = max(prices) if prices else 0.0
-        candidates.append((cid, top_p))
-
-    # Fallback raw IDs
-    all_raw_ids = set(re.findall(r'showRepairDetailModal\((\d+)', page))
-    for cid_s in all_raw_ids:
-        cid = int(cid_s)
-        if cid not in seen_ids:
-            candidates.append((cid, 0.0))
-            seen_ids.add(cid)
-
-    # Sort waiting customers by HIGHEST paying repair first
-    candidates.sort(key=lambda x: x[1], reverse=True)
-
-    # 3. ACCEPT / START REPAIRS INTO OPEN BAYS
-    if candidates:
-        for cid, price in candidates:
+    # 3. FILL OPEN BAYS CONCURRENTLY
+    for bay_attempt in range(open_slots):
+        candidates = _tamir_candidates(page)
+        if candidates:
+            cid, price = candidates[0]
             r_st = post(
                 sess,
                 "/tamir.php",
                 {"csrf_token": csrf, "customer_id": str(cid), "start_repair": "1"},
                 pause=False,
             )
-            label = f"${price:,.0f}" if price > 0 else "top quote"
+            label = f"${price:,.0f}" if price > 0 else "quote"
             if isinstance(r_st, dict) and r_st.get("success"):
                 cyc.add("tamir", f"start repair {cid} ({label})", True, "repair bay assigned!")
-            elif isinstance(r_st, dict) and any(w in str(msg(r_st)).lower() for w in ("dolu", "slot", "kapasite", "full", "max", "no available")):
-                cyc.add("tamir", "repair bays full", True, "all workshop slots working", soft=True)
+                page = get(sess, "/tamir.php")
+                continue
+            elif isinstance(r_st, dict) and any(w in str(msg(r_st)).lower() for w in ("dolu", "slot", "kapasite", "full", "max")):
+                cyc.add("tamir", "repair bays full", True, "all workshop slots filled", soft=True)
                 break
-            else:
-                # Page re-check after POST
-                p_check = get(sess, "/tamir.php")
-                if f"showRepairDetailModal({cid}" not in p_check:
-                    cyc.add("tamir", f"start repair {cid} ({label})", True, "repair in progress!")
-                else:
-                    cyc.add("tamir", f"start repair {cid}", True, "slot check", soft=True)
 
-    # 4. CALL NEW CUSTOMER (SOLVE PUZZLE IF NEEDED)
-    p_now = get(sess, "/tamir.php")
-    # Check cooldown from page: "lastCustomerTime = 12345"
-    m_last = re.search(r'const\s+lastCustomerTime\s*=\s*(\d+)', p_now)
-    m_srv = re.search(r'const\s+tamirServerNow\s*=\s*(\d+)', p_now)
-    in_cooldown = False
-    if m_last and m_srv:
-        try:
-            last_t = int(m_last.group(1))
-            srv_t = int(m_srv.group(1))
-            if last_t > 0 and (srv_t - last_t) < 60:
-                in_cooldown = True
-                cyc.add("tamir", "customer cooldown", True, f"{60 - (srv_t - last_t)}s remaining", soft=True)
-        except Exception:
-            pass
-
-    if not in_cooldown:
+        # No waiting customer in queue: call a new one via slider puzzle
         ok_puz, _ = solve_puzzle(sess, "/tamir.php", cyc)
+        if not ok_puz:
+            cyc.add("tamir", "call customer", False, "slider puzzle failed", soft=True)
+            break
         r_call = post(sess, "/tamir.php", {"csrf_token": csrf, "get_new_customer": "1"}, pause=False)
-        p_after = get(sess, "/tamir.php")
-        m_cust = re.findall(r'Customers\s*\((\d+)\)', p_after)
-        cust_cnt = m_cust[0] if m_cust else "1"
-        cyc.add("tamir", "call customer", True, f"customer queue: {cust_cnt} waiting")
+        if not (isinstance(r_call, dict) and r_call.get("success")):
+            cyc.add("tamir", "call customer", True, f"call cooldown/limit: {msg(r_call)}", soft=True)
+            break
+
+        # Re-fetch page immediately and START the newly arrived customer's repair
+        page = get(sess, "/tamir.php")
+        candidates = _tamir_candidates(page)
+        if not candidates:
+            cyc.add("tamir", "call customer", True, "queue refreshed", soft=True)
+            break
+
+        cid, price = candidates[0]
+        r_st = post(
+            sess,
+            "/tamir.php",
+            {"csrf_token": csrf, "customer_id": str(cid), "start_repair": "1"},
+            pause=False,
+        )
+        label = f"${price:,.0f}" if price > 0 else "quote"
+        if isinstance(r_st, dict) and r_st.get("success"):
+            cyc.add("tamir", f"start repair {cid} ({label})", True, "repair bay assigned!")
+        elif isinstance(r_st, dict) and any(w in str(msg(r_st)).lower() for w in ("dolu", "slot", "kapasite", "full", "max")):
+            cyc.add("tamir", "repair bays full", True, "all workshop slots filled", soft=True)
+            break
+        page = get(sess, "/tamir.php")
 
 
 # --------------------------------------------------------------------------- bank (bank.php)
