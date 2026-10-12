@@ -1944,6 +1944,7 @@ def section_jobs(sess, cyc: Cycle, inspect: bool) -> None:
         re.search(r'data-csrf="([0-9a-f]{64})"', page)
         or re.search(r'name="csrf_token"\s+value="([^"]+)"', page)
         or re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', page)
+        or re.search(r'csrf_token[\'\"]?\s*[:=]\s*[\'\"]([0-9a-f]{64})[\'\"]', page)
     )
     if m_csrf:
         csrf = m_csrf.group(1)
@@ -2042,14 +2043,15 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
 
     # 1. DELIVER / COLLECT COMPLETED REPAIRS
     completed_rids = set(
-        re.findall(r'collectIncomeTamir\((\d+)\)', page)
+        re.findall(r'collectRepairIncome\((\d+)\)', page)
+        + re.findall(r'collectIncomeTamir\((\d+)\)', page)
         + re.findall(r'data-repair-id=["\'](\d+)["\']', page)
         + re.findall(r'repair_id["\']?\s*:\s*["\']?(\d+)', page)
     )
     for rid in sorted(completed_rids, key=int):
         r_col = post(sess, "/collect_income_tamir.php", {"csrf_token": csrf, "repair_id": str(rid)}, pause=False)
         if isinstance(r_col, dict) and r_col.get("success"):
-            cyc.add("tamir", f"deliver repair {rid}", True, msg(r_col))
+            cyc.add("tamir", f"deliver car {rid}", True, f"delivered & credited! ({msg(r_col)})")
         elif isinstance(r_col, dict) and "repair" in str(msg(r_col)).lower():
             break
 
