@@ -2082,19 +2082,45 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
         csrf = m_csrf.group(1)
 
     # 1. DELIVER / COLLECT COMPLETED REPAIRS
+    comp_chunk = ""
+    m_comp = re.search(r'id=["\']completed["\'].*?(?:<div class=["\']tab-pane|\Z)', page, re.S)
+    if m_comp:
+        comp_chunk = m_comp.group(0)
+
     completed_rids = set(
-        re.findall(r'collectRepairIncome\((\d+)\)', page)
-        + re.findall(r'onclick=["\']collectRepairIncome\((\d+)\)["\']', page)
+        re.findall(r'collectRepairIncome\((\d+)\)', comp_chunk or page)
+        + re.findall(r'onclick=["\']collectRepairIncome\((\d+)\)["\']', comp_chunk or page)
+        + re.findall(r'data-repair-id=["\'](\d+)["\']', comp_chunk)
     )
     for rid in sorted(completed_rids, key=int):
         r_col = post(sess, "/collect_income_tamir.php", {"csrf_token": csrf, "repair_id": str(rid)}, pause=False)
         if isinstance(r_col, dict) and r_col.get("success"):
             cyc.add("tamir", f"deliver repair {rid}", True, msg(r_col))
         elif isinstance(r_col, dict):
-            log.debug("collect_income_tamir for %s: %s", rid, msg(r_col))
+            log.warning("collect_income_tamir for %s failed: %s", rid, msg(r_col))
 
-    # 2. CHECK WORKSHOP CAPACITY AND ACTIVE REPAIRS
+    # 2. VERIFY COMPLETED REPAIRS CLEARED BEFORE ANY NEW CAR INTAKE
     page = get(sess, "/tamir.php")
+    m_comp_after = re.search(r'id=["\']completed["\'].*?(?:<div class=["\']tab-pane|\Z)', page, re.S)
+    comp_chunk_after = m_comp_after.group(0) if m_comp_after else ""
+    still_completed = set(
+        re.findall(r'collectRepairIncome\((\d+)\)', comp_chunk_after or page)
+        + re.findall(r'data-repair-id=["\'](\d+)["\']', comp_chunk_after)
+    )
+    m_badge = re.search(r'id=["\']completed-tab["\'][^>]*>.*?Completed\s*\((\d+)\)', page, re.S | re.I)
+    badge_count = int(m_badge.group(1)) if m_badge else 0
+    if still_completed or badge_count > 0:
+        pending_cnt = max(len(still_completed), badge_count)
+        cyc.add(
+            "tamir",
+            "deliver pending",
+            False,
+            f"{pending_cnt} completed repair(s) waiting in Completed tab — new cars halted until delivered",
+            soft=True,
+        )
+        return
+
+    # 3. CHECK WORKSHOP CAPACITY AND ACTIVE REPAIRS
     m_slots = re.search(r'(\d+)\s+slots', page, re.I)
     total_slots = int(m_slots.group(1)) if m_slots else 6
     active_rids = re.findall(r'id=["\']repair-card-(\d+)["\']', page)
@@ -2106,7 +2132,7 @@ def section_tamir(sess, cyc: Cycle, inspect: bool) -> None:
         cyc.add("tamir", "workshop status", True, f"all {total_slots} bays working at 100% capacity", soft=True)
         return
 
-    # 3. FILL OPEN BAYS CONCURRENTLY
+    # 4. FILL OPEN BAYS CONCURRENTLY
     for bay_attempt in range(open_slots):
         candidates = _tamir_candidates(page)
         if candidates:
