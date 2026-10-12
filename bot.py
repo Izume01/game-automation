@@ -56,7 +56,7 @@ BASE = os.environ.get("TICARISK_BASE", "https://www.ticarisk.com").rstrip("/")
 USER = os.environ.get("TICARISK_USER", "")
 PASSWORD = os.environ.get("TICARISK_PASS", "")
 
-DEFAULT_SECTIONS = "production,isyeri,fields,orchards,barns,coops,bees,math,jobs,tamir,bank,ortak"
+DEFAULT_SECTIONS = "production,isyeri,fields,orchards,barns,coops,bees,math,jobs,tamir,bank,ortak,ihale"
 
 # Bank 2% Daily Interest (bank.php)
 BANK_AUTO_DEPOSIT = os.environ.get("TICARISK_BANK_DEPOSIT", "1") == "1"
@@ -364,7 +364,7 @@ def balance(sess: requests.Session) -> Optional[float]:
         html = get(sess, "/index.php")
     except Exception:
         return None
-    m = re.search(r"nav-stat-balance'[^>]*data-value='(-?[\d.]+)'", html)
+    m = re.search(r"nav-stat-balance['\"][^>]*data-value=['\"](-?[\d.]+)['\"]", html) or re.search(r"data-value=['\"](-?[\d.]+)['\"][^>]*nav-stat-balance", html)
     return float(m.group(1)) if m else None
 
 
@@ -2158,13 +2158,25 @@ def section_bank(sess, cyc: Cycle, inspect: bool) -> None:
 
     # 1. Check if a mature deposit can be withdrawn with 2% interest
     if BANK_AUTO_WITHDRAW:
-        for act in ("withdraw", "para_cek", "cek", "withdraw_deposit"):
-            r = post(sess, "/bank.php", {"action": act, "csrf_token": csrf, "ajax": "true", "ajax_request": 1}, pause=False)
-            if isinstance(r, dict) and r.get("success"):
-                cyc.add("bank", "withdraw matured deposit", True, f"collected with 2% interest! ({msg(r)})")
-                break
-            elif isinstance(r, dict) and any(w in str(msg(r)).lower() for w in ("sure", "vade", "bekle", "yok", "maturity")):
-                break
+        # Check withdraw modal rows for matured deposits (countdown <= 0)
+        m_withdraw_rows = re.findall(
+            r'<tr>\s*<td>\$([0-9,.]+)</td>\s*<td>.*?<span[^>]*class="text-success">\$([0-9,.]+)</span>.*?<span[^>]*class="[^"]*countdown"[^>]*data-seconds="(\d+)".*?<input[^>]*name="deposit_id"[^>]*value="(\d+)"',
+            page,
+            re.DOTALL,
+        )
+        for dep_val, mat_val, sec_s, dep_id in m_withdraw_rows:
+            try:
+                sec = int(sec_s)
+            except ValueError:
+                sec = 0
+            if sec <= 0:
+                post(
+                    sess,
+                    "/bank.php",
+                    {"csrf_token": csrf, "deposit_id": str(dep_id), "withdraw_money": "1"},
+                    pause=False,
+                )
+                cyc.add("bank", f"withdraw matured deposit {dep_id}", True, f"${mat_val} collected with 2% interest!")
 
     # 2. Deposit idle cash to earn 2% daily interest (up to $30M cap, keeping reserve liquidity)
     if BANK_AUTO_DEPOSIT:
@@ -2181,24 +2193,21 @@ def section_bank(sess, cyc: Cycle, inspect: bool) -> None:
             deposit_amt = int(min(bal - BANK_RESERVE, 30000000 - currently_deposited))
             deposit_amt = (deposit_amt // 1000) * 1000  # round down to nearest thousand
             if deposit_amt >= 1000:
-                deposited = False
-                for act in ("deposit", "para_yatir", "yatir", "add_deposit"):
-                    r = post(
-                        sess,
-                        "/bank.php",
-                        {"action": act, "amount": str(deposit_amt), "miktar": str(deposit_amt), "csrf_token": csrf, "ajax": "true", "ajax_request": 1},
-                        pause=False,
-                    )
-                    if isinstance(r, dict) and r.get("success"):
-                        cyc.add("bank", "deposit", True, f"locked ${deposit_amt:,} earning 2% daily interest ({msg(r)})")
-                        deposited = True
-                        break
-                    elif isinstance(r, dict) and "limit" in str(msg(r)).lower():
-                        cyc.add("bank", "deposit", True, msg(r), soft=True)
-                        deposited = True
-                        break
-                if not deposited:
-                    cyc.add("bank", "deposit", True, f"eligible ${deposit_amt:,} (reserve kept ${BANK_RESERVE:,.0f})", soft=True)
+                post(
+                    sess,
+                    "/bank.php",
+                    {"csrf_token": csrf, "deposit_amount": str(deposit_amt), "deposit_money": "true"},
+                    pause=False,
+                )
+                p_after = get(sess, "/bank.php")
+                m_after = re.search(r'Total\s+Deposited\s*<[^>]+>\s*\$([0-9,.]+)', p_after, re.I)
+                new_dep_val = float(m_after.group(1).replace(",", "").replace(".", "")) if m_after else 0.0
+                if new_dep_val > currently_deposited:
+                    cyc.add("bank", "deposit", True, f"locked ${deposit_amt:,} earning 2% daily interest (Total in bank: ${m_after.group(1)})")
+                else:
+                    m_wait = re.search(r'wait\s+([0-9a-zA-Z\s]+)\s+before\s+making\s+a\s+new\s+deposit', p_after, re.I)
+                    wait_str = m_wait.group(1).strip() if m_wait else "24h cooldown"
+                    cyc.add("bank", "deposit cooldown", True, f"{wait_str} remaining before next deposit", soft=True)
 
 
 # --------------------------------------------------------------------------- joint jobs (ortak.php)
@@ -2367,6 +2376,99 @@ def section_ortak(sess, cyc: Cycle, inspect: bool) -> None:
             cyc.add("ortak", "status", True, "checked open joint jobs", soft=True)
 
 
+# --------------------------------------------------------------------------- government tenders (ihale.php)
+
+
+def section_ihale(sess, cyc: Cycle, inspect: bool) -> None:
+    """Government Tenders (ihale.php): monitors active auctions (19:00-00:00 TRT), enters top 4 matched against inventory, counter-bids when undercut."""
+    r_res = sess.post(
+        f"{BASE}/cron/ihale_ajax.php",
+        data={"action": "get_ihaleler"},
+        headers={"X-Requested-With": "XMLHttpRequest", "Referer": f"{BASE}/ihale.php"},
+        verify=False,
+    )
+    if r_res.status_code != 200:
+        cyc.add("ihale", "status", True, f"HTTP {r_res.status_code}", soft=True)
+        return
+
+    try:
+        data = r_res.json()
+    except Exception:
+        cyc.add("ihale", "status", True, "invalid response", soft=True)
+        return
+
+    ihaleler = data.get("ihaleler", [])
+    envanter = data.get("envanter_map", {})
+    if not ihaleler:
+        cyc.add("ihale", "schedule", True, "auctions open daily 19:00-00:00 TRT (0 active currently)", soft=True)
+        return
+
+    user_id = data.get("user_id") or 18141
+
+    # 1. Counter-bid if outbid
+    for ihale in ihaleler:
+        iid = ihale.get("id")
+        p_name = ihale.get("urun_adi", "")
+        qty = ihale.get("miktar", 0)
+        tavan = float(ihale.get("tavan_fiyat", 0))
+        lowest = float(ihale.get("en_dusuk_teklif", tavan))
+        lowest_uid = ihale.get("en_dusuk_teklif_user_id")
+        my_last = ihale.get("benim_son_teklif")
+
+        if my_last is not None and lowest_uid != user_id:
+            inv_qty = envanter.get(p_name.lower().strip(), 0)
+            if inv_qty >= qty and lowest > 10.0:
+                new_bid = round(lowest - 0.01, 2)
+                r_bid = sess.post(
+                    f"{BASE}/cron/ihale_ajax.php",
+                    data={"action": "teklif_ver", "ihale_id": str(iid), "teklif": str(new_bid)},
+                    headers={"X-Requested-With": "XMLHttpRequest", "Referer": f"{BASE}/ihale.php"},
+                    verify=False,
+                )
+                res_j = r_bid.json() if r_bid.status_code == 200 else {}
+                if res_j.get("success"):
+                    cyc.add("ihale", f"counter-bid {p_name} (#{iid})", True, f"placed winning bid ${new_bid:.2f} ({qty:,} units)")
+                else:
+                    cyc.add("ihale", f"counter-bid {p_name}", True, msg(res_j), soft=True)
+
+    # 2. Enter top matching tenders if open slots available (max 4 active bids)
+    active_bids = [i for i in ihaleler if i.get("benim_teklif_aktif") == 1]
+    if len(active_bids) < 4:
+        slots_left = 4 - len(active_bids)
+        candidates = []
+        for ihale in ihaleler:
+            iid = ihale.get("id")
+            p_name = ihale.get("urun_adi", "")
+            qty = ihale.get("miktar", 0)
+            tavan = float(ihale.get("tavan_fiyat", 0))
+            lowest = float(ihale.get("en_dusuk_teklif", tavan))
+            inv_qty = envanter.get(p_name.lower().strip(), 0)
+
+            if ihale.get("benim_teklif_aktif") != 1 and inv_qty >= qty and not ihale.get("vip_only"):
+                est_val = qty * lowest
+                candidates.append((ihale, est_val))
+
+        candidates.sort(key=lambda x: -x[1])
+        for ihale, val in candidates[:slots_left]:
+            iid = ihale.get("id")
+            p_name = ihale.get("urun_adi", "")
+            qty = ihale.get("miktar", 0)
+            tavan = float(ihale.get("tavan_fiyat", 0))
+            lowest = float(ihale.get("en_dusuk_teklif", tavan))
+            bid_price = round(lowest - 0.01, 2) if ihale.get("en_dusuk_teklif_user_id") else tavan
+            r_bid = sess.post(
+                f"{BASE}/cron/ihale_ajax.php",
+                data={"action": "teklif_ver", "ihale_id": str(iid), "teklif": str(bid_price)},
+                headers={"X-Requested-With": "XMLHttpRequest", "Referer": f"{BASE}/ihale.php"},
+                verify=False,
+            )
+            res_j = r_bid.json() if r_bid.status_code == 200 else {}
+            if res_j.get("success"):
+                cyc.add("ihale", f"bid {p_name} (#{iid})", True, f"entered tender @ ${bid_price:.2f} (~${val:,.0f})")
+            else:
+                cyc.add("ihale", f"bid {p_name}", True, msg(res_j), soft=True)
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -2409,6 +2511,8 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         section_tamir(sess, cyc, inspect)
     if "bank" in sections:
         section_bank(sess, cyc, inspect)
+    if "ihale" in sections:
+        section_ihale(sess, cyc, inspect)
 
     if inspect:
         pages_to_dump = [
