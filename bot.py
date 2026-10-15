@@ -2205,25 +2205,35 @@ def section_bank(sess, cyc: Cycle, inspect: bool) -> None:
 
     # 1. Check if a mature deposit can be withdrawn with 2% interest
     if BANK_AUTO_WITHDRAW:
-        # Check withdraw modal rows for matured deposits (countdown <= 0)
-        m_withdraw_rows = re.findall(
-            r'<tr>\s*<td>\$([0-9,.]+)</td>\s*<td>.*?<span[^>]*class="text-success">\$([0-9,.]+)</span>.*?<span[^>]*class="[^"]*countdown"[^>]*data-seconds="(\d+)".*?<input[^>]*name="deposit_id"[^>]*value="(\d+)"',
-            page,
-            re.DOTALL,
-        )
-        for dep_val, mat_val, sec_s, dep_id in m_withdraw_rows:
-            try:
-                sec = int(sec_s)
-            except ValueError:
-                sec = 0
-            if sec <= 0:
-                post(
-                    sess,
-                    "/bank.php",
-                    {"csrf_token": csrf, "deposit_id": str(dep_id), "withdraw_money": "1"},
-                    pause=False,
+        # Check withdraw modal rows for matured deposits
+        for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', page, re.DOTALL):
+            if "withdraw" not in tr.lower() or "deposit_id" not in tr:
+                continue
+
+            # Critical safety: NEVER withdraw early if it forfeits interest
+            if re.search(r'Early\s+Withdrawal', tr, re.I):
+                continue
+
+            is_matured = bool(re.search(r'Matured', tr, re.I))
+            m_sec = re.search(r'data-seconds=["\']?(\d+)', tr)
+            sec_left = int(m_sec.group(1)) if m_sec else (0 if is_matured else 999999)
+
+            if is_matured or sec_left <= 0:
+                m_dep_id = (
+                    re.search(r'name=["\']deposit_id["\']\s+value=["\'](\d+)["\']', tr)
+                    or re.search(r'value=["\'](\d+)["\']\s+name=["\']deposit_id["\']', tr)
                 )
-                cyc.add("bank", f"withdraw matured deposit {dep_id}", True, f"${mat_val} collected with 2% interest!")
+                if m_dep_id:
+                    dep_id = m_dep_id.group(1)
+                    m_mat = re.search(r'<span[^>]*class="text-success">\$([0-9,.]+)</span>', tr) or re.search(r'\$([0-9,.]+)\s*<small>\(\(At Maturity\)\)', tr)
+                    mat_val = m_mat.group(1) if m_mat else "deposit"
+                    post(
+                        sess,
+                        "/bank.php",
+                        {"csrf_token": csrf, "deposit_id": str(dep_id), "withdraw_money": "1"},
+                        pause=False,
+                    )
+                    cyc.add("bank", f"withdraw matured deposit {dep_id}", True, f"${mat_val} collected with 2% interest!")
 
     # 2. Deposit idle cash to earn 2% daily interest (up to $30M cap, keeping reserve liquidity)
     if BANK_AUTO_DEPOSIT:
