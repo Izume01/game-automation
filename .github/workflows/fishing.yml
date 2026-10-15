@@ -63,10 +63,11 @@ jobs:
           TICARISK_PASS: ${{ secrets.TICARISK_PASS }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '28' }}
           EXTRA_FLAG: ${{ inputs.dry_run && '--dry-run' || '' }}
+          PYTHONUNBUFFERED: "1"
         run: |
           DURATION_SEC=$(( ${DURATION_MINUTES:-28} * 60 ))
           echo "Running fishing loop for ${DURATION_MINUTES} minutes (${DURATION_SEC} seconds)..."
-          python fish.py --duration "$DURATION_SEC" $EXTRA_FLAG
+          python -u fish.py --duration "$DURATION_SEC" $EXTRA_FLAG
 
       - name: Upload fishing log
         if: always()

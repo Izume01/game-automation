@@ -329,6 +329,11 @@ if __name__ == "__main__":
     ap.add_argument("--dry-run", action="store_true", help="dry run mode")
     args = ap.parse_args()
 
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-5s %(message)s",
