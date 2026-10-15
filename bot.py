@@ -56,7 +56,7 @@ BASE = os.environ.get("TICARISK_BASE", "https://www.ticarisk.com").rstrip("/")
 USER = os.environ.get("TICARISK_USER", "")
 PASSWORD = os.environ.get("TICARISK_PASS", "")
 
-DEFAULT_SECTIONS = "production,isyeri,fields,orchards,barns,coops,bees,math,jobs,tamir,bank,ortak"
+DEFAULT_SECTIONS = "production,isyeri,fields,orchards,barns,coops,bees,math,jobs,tamir,bank,ortak,fishing"
 
 # Bank 2% Daily Interest (bank.php)
 BANK_AUTO_DEPOSIT = os.environ.get("TICARISK_BANK_DEPOSIT", "1") == "1"
@@ -2425,6 +2425,22 @@ def section_ortak(sess, cyc: Cycle, inspect: bool) -> None:
 
 
 
+# --------------------------------------------------------------------------- fishing (balikcilik.php)
+
+
+def section_fishing(sess, cyc: Cycle, inspect: bool) -> None:
+    """Fishing (balikcilik.php): casts rod, reels in catch, sends boat trips, and claims daily quests."""
+    import fish
+
+    if inspect:
+        try:
+            dump("inspect/balikcilik.html", get(sess, "/balikcilik.php"))
+        except Exception as exc:
+            log.debug("inspect dump balikcilik failed: %s", exc)
+
+    fish.fishing_step(sess, cyc)
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -2467,6 +2483,8 @@ def run_cycle(sections: Sequence[str], inspect: bool, dry_run: bool) -> Cycle:
         section_tamir(sess, cyc, inspect)
     if "bank" in sections:
         section_bank(sess, cyc, inspect)
+    if "fishing" in sections:
+        section_fishing(sess, cyc, inspect)
 
     if inspect:
         pages_to_dump = [
@@ -2499,6 +2517,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     ap.add_argument("--inspect", action="store_true", help="dump pages to inspect/")
     ap.add_argument("--dry-run", action="store_true", help="report only, change nothing")
+    ap.add_argument("--fish-loop", action="store_true", help="run dedicated continuous 3-min / 7-min fishing loop")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -2512,6 +2531,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ],
     )
     urllib3.disable_warnings()
+
+    if args.fish_loop:
+        import fish
+
+        fish.loop_fishing()
+        return 0
 
     sections = [s.strip().lower() for s in args.sections.split(",") if s.strip()]
     unknown = set(sections) - set(DEFAULT_SECTIONS.split(","))
