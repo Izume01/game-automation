@@ -56,7 +56,7 @@ BASE = os.environ.get("TICARISK_BASE", "https://www.ticarisk.com").rstrip("/")
 USER = os.environ.get("TICARISK_USER", "")
 PASSWORD = os.environ.get("TICARISK_PASS", "")
 
-DEFAULT_SECTIONS = "production,isyeri,fields,orchards,barns,coops,bees,math,jobs,tamir,bank,ortak,fishing"
+DEFAULT_SECTIONS = "production,isyeri,fields,orchards,barns,coops,bees,math,jobs,tamir,bank,ortak"
 
 # Bank 2% Daily Interest (bank.php)
 BANK_AUTO_DEPOSIT = os.environ.get("TICARISK_BANK_DEPOSIT", "1") == "1"
