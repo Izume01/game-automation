@@ -279,16 +279,18 @@ def fishing_step(sess: requests.Session, cyc: bot.Cycle) -> Dict[str, Any]:
     }
 
 
-def loop_fishing(poll_limit: Optional[int] = None) -> None:
+def loop_fishing(poll_limit: Optional[int] = None, duration_sec: Optional[int] = None) -> None:
     """Run persistent fishing loop with intelligent dynamic sleep timers."""
     log.info("starting continuous Ticarisk Fishing loop (3-min rod / 7-min boat)...")
     sess = bot.login()
     cycles = 0
+    start_time = time.time()
 
     while True:
         cycles += 1
         cyc = bot.Cycle()
-        log.info("=== Fishing Pass #%d ===", cycles)
+        elapsed = time.time() - start_time
+        log.info("=== Fishing Pass #%d (elapsed: %.1f min) ===", cycles, elapsed / 60)
         try:
             res = fishing_step(sess, cyc)
             rod_left = res["rod_left"]
@@ -310,19 +312,38 @@ def loop_fishing(poll_limit: Optional[int] = None) -> None:
             log.info("reached poll limit of %d cycles. Exiting.", poll_limit)
             break
 
+        if duration_sec and (time.time() - start_time + sleep_sec) > duration_sec:
+            log.info("duration limit of %ds reached (ran %.1f min). Exiting cleanly.", duration_sec, (time.time() - start_time) / 60)
+            break
+
         time.sleep(sleep_sec)
 
 
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Ticarisk Fishing Automation")
+    ap.add_argument("--loop", action="store_true", help="run continuous loop")
+    ap.add_argument("--duration", type=int, default=0, help="max runtime in seconds for loop mode")
+    ap.add_argument("--max-cycles", type=int, default=0, help="max loop passes")
+    ap.add_argument("--dry-run", action="store_true", help="dry run mode")
+    args = ap.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-5s %(message)s",
         datefmt="%H:%M:%S",
     )
     urllib3.disable_warnings()
-    # If run directly with --loop, run infinite loop; otherwise run 1 single pass
-    if "--loop" in sys.argv:
-        loop_fishing()
+
+    if args.dry_run:
+        bot.DRY_RUN = True
+
+    if args.loop or args.duration > 0:
+        loop_fishing(
+            poll_limit=args.max_cycles or None,
+            duration_sec=args.duration or None,
+        )
     else:
         s = bot.login()
         c = bot.Cycle()

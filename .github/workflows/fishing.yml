@@ -1,0 +1,78 @@
+name: ticarisk-fishing
+
+# Dedicated Fishing Automation Workflow (balikcilik.php)
+# Runs continuously inside the GitHub Actions runner, dynamically catching fish
+# every ~2.5-3 min (rod) and dispatching/collecting boat hauls every ~7-8 min.
+#
+# PUBLIC repo -> Actions minutes are 100% UNLIMITED and FREE.
+#
+# Runs on a 30-minute schedule. Inside each 30-minute runner, it loops in real-time,
+# auto-solving slider puzzles, reeling in rod catches, sending out boat trips,
+# claiming daily quest rewards, and preserving all catches in the Cold Store.
+
+on:
+  schedule:
+    # Runs every 30 minutes
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Duration in minutes to run the fishing loop"
+        type: string
+        default: "28"
+      dry_run:
+        description: "Report only, change nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Avoid overlapping runners competing on the same fishing rod/boat
+concurrency:
+  group: ticarisk-fishing
+  cancel-in-progress: false
+
+jobs:
+  fish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Imagemagick is required for decoding the slider captcha JPEG background
+      - name: Install ImageMagick
+        run: |
+          command -v convert >/dev/null 2>&1 || {
+            sudo apt-get update -qq -o Acquire::Retries=3
+            timeout 120 sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends imagemagick
+          }
+          convert -version | head -1
+
+      - name: Run Fishing Loop
+        env:
+          TICARISK_USER: ${{ secrets.TICARISK_USER }}
+          TICARISK_PASS: ${{ secrets.TICARISK_PASS }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '28' }}
+          EXTRA_FLAG: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          DURATION_SEC=$(( ${DURATION_MINUTES:-28} * 60 ))
+          echo "Running fishing loop for ${DURATION_MINUTES} minutes (${DURATION_SEC} seconds)..."
+          python fish.py --duration "$DURATION_SEC" $EXTRA_FLAG
+
+      - name: Upload fishing log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fishing-log-${{ github.run_number }}
+          path: ticarisk-cycle.log
+          if-no-files-found: ignore
+          retention-days: 7
