@@ -31,7 +31,7 @@
     const FEED_ANIMALS = true;
     const PETEK_REFILL = true;               // buy honeycomb back after a harvest
     const PETEK_PRICE = 1500;                // $ per honeycomb
-    const PETEK_MAX_SPEND = 60000;           // hard ceiling per refill
+    const PETEK_MAX_SPEND = 2000000;         // hard ceiling per refill ($2,000,000 covers full cash + diamond hives)
     const MATH_GRIND = true;                 // solve every available question each cycle
     const MATH_WITHDRAW = true;              // move the math vault into the balance
     const MATH_MAX_ROUNDS = 600;             // safety stop
@@ -1384,24 +1384,23 @@
                 step('bees', 'comb ' + k, { success: true, message: 'full (' + st.petek + '/' + st.max_petek + ')' });
                 continue;
             }
-            const cost = want * PETEK_PRICE;
-            if (cost > PETEK_MAX_SPEND) {
-                step('bees', 'buy ' + want + ' comb', {
-                    success: false,
-                    message: '$' + cost.toLocaleString() + ' exceeds PETEK_MAX_SPEND=$' + PETEK_MAX_SPEND.toLocaleString()
-                }, true);
-                continue;
-            }
             const bal = await balanceOf();
-            if (bal !== null && cost > bal) {
-                step('bees', 'buy ' + want + ' comb', {
-                    success: false, message: 'cost $' + cost.toLocaleString() + ' is above the $' + bal.toFixed(2) + ' balance'
+            const maxByLimit = Math.floor(PETEK_MAX_SPEND / PETEK_PRICE);
+            const maxByBal = (bal !== null && bal > 0) ? Math.floor(bal / PETEK_PRICE) : want;
+            const toBuy = Math.min(want, maxByLimit, maxByBal);
+
+            if (toBuy <= 0) {
+                step('bees', 'buy comb ' + k, {
+                    success: false,
+                    message: 'cannot afford (want ' + want + ', bal=$' + (bal || 0).toLocaleString() + ', limit=$' + PETEK_MAX_SPEND.toLocaleString() + ')'
                 }, true);
                 continue;
             }
-            step('bees', 'buy ' + want + ' comb ($' + cost.toLocaleString() + ')',
+
+            const cost = toBuy * PETEK_PRICE;
+            step('bees', 'buy ' + toBuy + ' comb ($' + cost.toLocaleString() + ')',
                 await postJson('/aricilik.php', {
-                    ajax_request: 1, petek_ekle: 1, aricilik_id: k, petek_adet: want
+                    ajax_request: 1, petek_ekle: 1, aricilik_id: k, petek_adet: toBuy
                 }));
         }
     }

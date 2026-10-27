@@ -103,7 +103,7 @@ FEED_ANIMALS = os.environ.get("TICARISK_FEED_ANIMALS", "1") == "1"
 # Beekeeping: bal_hasat burns the honeycomb, so each cycle has to buy them
 # back at $1,500 each. 0 = harvest only, never buy.
 PETEK_REFILL = os.environ.get("TICARISK_PETEK_REFILL", "1") == "1"
-PETEK_MAX_SPEND = float(os.environ.get("TICARISK_PETEK_MAX_SPEND", "60000"))
+PETEK_MAX_SPEND = float(os.environ.get("TICARISK_PETEK_MAX_SPEND", "2000000"))
 PETEK_PRICE = 1500
 
 # Water defaults to 2000 L to safely support full 11-field farm (11 x 150 L = 1650 L)
@@ -1096,25 +1096,37 @@ def _animals(sess, cyc: Cycle, inspect: bool, section: str, path: str, attr: str
 def bee_areas(html: str) -> Dict[int, Dict[str, int]]:
     """aricilik_id -> {hives, petek, max_petek}.
 
-    The ids exist only inside the buy-button onclick handlers
-    (kovanAlModal(3179, 4, 0) / petekAlModal(3179, 4, 40)). There is no
-    data-aricilik-id attribute anywhere on the page, which is why a scan for
-    it reported "no beekeeping area owned" on an account that has one.
+    The ids exist inside the button onclick handlers
+    (kovanAlModal(3179, 4, 0) / petekAlModal(3179, 4, 40) / balHasat(3179)).
     """
     out: Dict[int, Dict[str, int]] = {}
-    for i, tl, _diamond in re.findall(
+    for i, tl, diamond in re.findall(
         r"kovanAlModal\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", html
     ):
         d = out.setdefault(int(i), {"hives": 0, "petek": 0, "max_petek": 0})
-        d["hives"] += int(tl)  # cash hives; diamond hives are a separate 100-limit pool
+        d["hives"] = int(tl) + int(diamond)
     for i, hives, mevcut in re.findall(
         r"petekAlModal\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", html
     ):
         d = out.setdefault(int(i), {"hives": 0, "petek": 0, "max_petek": 0})
         d["hives"] = max(d["hives"], int(hives))
         d["petek"] = int(mevcut)
+    for aid in re.findall(r"balHasat\(\s*(\d+)\s*\)", html):
+        out.setdefault(int(aid), {"hives": 0, "petek": 0, "max_petek": 0})
+
+    # Stat-tile fallback if modal onclick attributes were not present or 0
+    m_hives = re.search(r'<div[^>]*class=["\']tile-val["\'][^>]*>(\d+)</div>\s*<div[^>]*class=["\']tile-lbl["\'][^>]*>Hive</div>', html, re.I)
+    m_petek = re.search(r'<div[^>]*class=["\']tile-val["\'][^>]*>(\d+)/(\d+)</div>\s*<div[^>]*class=["\']tile-lbl["\'][^>]*>Honeycomb</div>', html, re.I)
+
     for d in out.values():
-        d["max_petek"] = d["hives"] * 10  # site rule: maxPetek = kovanSayisi * 10
+        if d["hives"] == 0 and m_hives:
+            d["hives"] = int(m_hives.group(1))
+        if m_petek:
+            cur_p, max_p = int(m_petek.group(1)), int(m_petek.group(2))
+            d["petek"] = cur_p
+            d["max_petek"] = max_p
+        elif d["max_petek"] == 0:
+            d["max_petek"] = d["hives"] * 10
     return out
 
 
@@ -1129,7 +1141,17 @@ def section_bees(sess, cyc: Cycle, inspect: bool) -> None:
 
     for aid in sorted(areas):
         res = post(sess, "/aricilik.php", {"ajax_request": 1, "bal_hasat": 1, "aricilik_id": aid})
-        cyc.add("bees", f"harvest {aid}", ok(res), msg(res))
+        good = ok(res)
+        cyc.add(
+            "bees",
+            f"harvest {aid}",
+            good,
+            msg(res),
+            soft=(not good) and (
+                SOFT_RE.search(str(msg(res))) is not None
+                or any(w in str(msg(res)).lower() for w in ("hazır", "zaman", "ready", "bulunamadı", "not ready"))
+            ),
+        )
 
     if not PETEK_REFILL:
         cyc.add("bees", "refill comb", True, "skipped (TICARISK_PETEK_REFILL=0)")
@@ -1146,32 +1168,36 @@ def section_bees(sess, cyc: Cycle, inspect: bool) -> None:
         if want <= 0:
             cyc.add("bees", f"comb {aid}", True, f"full ({st['petek']}/{st['max_petek']})")
             continue
-        cost = want * PETEK_PRICE
-        if cost > PETEK_MAX_SPEND:
-            cyc.add(
-                "bees",
-                f"buy {want} comb",
-                False,
-                f"${cost:,} exceeds TICARISK_PETEK_MAX_SPEND=${PETEK_MAX_SPEND:,.0f}",
-                soft=True,
-            )
-            continue
+
         bal = balance(sess)
-        if bal is not None and cost > bal:
+        max_by_limit = int(PETEK_MAX_SPEND // PETEK_PRICE) if PETEK_MAX_SPEND > 0 else want
+        max_by_bal = int(bal // PETEK_PRICE) if (bal is not None and bal > 0) else want
+        to_buy = min(want, max_by_limit, max_by_bal)
+
+        if to_buy <= 0:
             cyc.add(
                 "bees",
-                f"buy {want} comb",
+                f"buy comb {aid}",
                 False,
-                f"cost ${cost:,} is above the ${bal:,.2f} balance",
+                f"cannot afford (want {want}, bal=${bal or 0:,.0f}, limit=${PETEK_MAX_SPEND:,.0f})",
                 soft=True,
             )
             continue
+
+        cost = to_buy * PETEK_PRICE
         res = post(
             sess,
             "/aricilik.php",
-            {"ajax_request": 1, "petek_ekle": 1, "aricilik_id": aid, "petek_adet": want},
+            {"ajax_request": 1, "petek_ekle": 1, "aricilik_id": aid, "petek_adet": to_buy},
         )
-        cyc.add("bees", f"buy {want} comb (${cost:,})", ok(res), msg(res))
+        good = ok(res)
+        cyc.add(
+            "bees",
+            f"buy {to_buy} comb (${cost:,})",
+            good,
+            msg(res),
+            soft=(not good) and SOFT_RE.search(str(msg(res))) is not None,
+        )
 
 
 

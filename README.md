@@ -42,7 +42,7 @@ everything else still runs.
    | `TICARISK_MAX_WATER_SPEND` | `0` (no cap) | hard ceiling on $ spent on water |
    | `TICARISK_FEED_ANIMALS` | `1` | `0` = collect only, never buy feed |
    | `TICARISK_PETEK_REFILL` | `1` | after a harvest, buy honeycomb back up to `hives × 10` |
-   | `TICARISK_PETEK_MAX_SPEND` | `60000` | hard ceiling ($) on one refill — honeycomb is **$1,500** each |
+   | `TICARISK_PETEK_MAX_SPEND` | `2000000` | hard ceiling ($) on one refill — honeycomb is **$1,500** each |
    | `TICARISK_MATH` | `1` | `0` = never touch the math game |
    | `TICARISK_MATH_MAX` | `400` | safety stop on questions per run (the pool is ~300/h) |
    | `TICARISK_MATH_WITHDRAW` | `1` | `1` = move the vault into the balance when done |
@@ -110,7 +110,7 @@ only when stock is under its trigger.
 |---|---|---|
 | **water** | tank drops under `TICARISK_WATER_TRIGGER` (1,000 L), or a field says `Not enough water!` | `TICARISK_MAX_WATER_SPEND` per buy (**$20,000**) **and** `TICARISK_MAX_WATER_DAY` per day (**$1,000,000**) |
 | **feed top-up** | only when stock < trigger | per-material cap + `TICARISK_MAX_RESTOCK_SPEND` (**$400,000/day**) |
-| **honeycomb** | only when the page reports combs below max | `TICARISK_PETEK_MAX_SPEND` (**$60,000**) |
+| **honeycomb** | only when the page reports combs below max | `TICARISK_PETEK_MAX_SPEND` (**$2,000,000**) |
 | animal feed action | — | free (uses stock) |
 
 Triggers are sized against measured burn, not guesswork — the account burns
