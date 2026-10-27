@@ -529,6 +529,27 @@ def dump(path: str, content) -> None:
         log.warning("could not write %s: %s", path, exc)
 
 
+def _parse_slot_modal_products(modal_html: str, bid: str, slot_id: str) -> List[Tuple[str, bool]]:
+    """Extract (product_name, has_enough) tuples from the modal HTML for a given business slot."""
+    modal_pat = (
+        r'id=["\']productSelectModal%s_slot%s["\'].*?(?=<div[^>]*id=["\'](?:productSelectModal|levelUpModal)|\Z)'
+        % (bid, slot_id)
+    )
+    m = re.search(modal_pat, modal_html, re.S)
+    chunk = m.group(0) if m else modal_html
+
+    results: List[Tuple[str, bool]] = []
+    for tag_match in re.finditer(r'<[^>]+data-biz-product-select=["\']?1["\']?[^>]*>', chunk):
+        tag = tag_match.group(0)
+        m_name = re.search(r'data-product-name=["\']([^"\']+)["\']', tag)
+        m_enough = re.search(r'data-has-enough=["\']([01])["\']', tag)
+        if m_name:
+            p_name = m_name.group(1).strip()
+            enough = m_enough.group(1) == "1" if m_enough else True
+            results.append((p_name, enough))
+    return results
+
+
 # --------------------------------------------------------------------------- production
 
 
@@ -584,7 +605,7 @@ def section_production(sess, cyc: Cycle, inspect: bool) -> None:
 
     starts = [f for f in forms if f[2] == "start_production"]
     if not starts:
-        cyc.add("production", "restart", True, "no idle production slot found")
+        cyc.add("production", "restart", True, "no idle production slot found", soft=True)
     else:
         for label, bid, _btn, tok in starts:
             r2 = post(
@@ -599,6 +620,51 @@ def section_production(sess, cyc: Cycle, inspect: bool) -> None:
                 good,
                 msg(r2),
                 soft=(not good) and SOFT_RE.search(str(msg(r2))) is not None,
+            )
+
+    # 3 — Multi-slot food plants (Beverage & Dairy plants)
+    food_src = owned.get("food") or ""
+    idle_slots = list(dict.fromkeys(re.findall(r'#productSelectModal(\d+)_slot(\d+)', food_src)))
+    if idle_slots:
+        modals_data = lazy(sess, "modals")
+        modals_html = modals_data.get("html") or "" if isinstance(modals_data, dict) else ""
+        csrf = csrf_of(page)
+
+        for bid, slot_id in idle_slots:
+            prods = _parse_slot_modal_products(modals_html, bid, slot_id)
+            if not prods:
+                continue
+
+            day_idx = datetime.date.today().timetuple().tm_yday
+            slot_offset = int(slot_id) - 1 if slot_id.isdigit() else 0
+
+            available = [p for p in prods if p[1]]
+            if not available:
+                cyc.add("production", f"slot {bid}/{slot_id}", False, "no product with sufficient ingredients", soft=True)
+                continue
+
+            # Day-wise rotation: offset by slot index so multiple slots produce diverse items
+            preferred_name = prods[(day_idx + slot_offset) % len(prods)][0]
+            chosen = preferred_name if any(p[0] == preferred_name for p in available) else available[0][0]
+
+            r_slot = post(
+                sess,
+                "/businesses.php",
+                {
+                    "csrf_token": csrf,
+                    "business_id": str(bid),
+                    "start_production": "1",
+                    "selected_product": chosen,
+                    "slot_id": str(slot_id),
+                },
+            )
+            good = ok(r_slot)
+            cyc.add(
+                "production",
+                f"start slot {bid}/{slot_id} ({chosen})",
+                good,
+                msg(r_slot),
+                soft=(not good) and SOFT_RE.search(str(msg(r_slot))) is not None,
             )
 
     _top_up_water(sess, cyc)
