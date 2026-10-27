@@ -531,22 +531,42 @@ def dump(path: str, content) -> None:
 
 def _parse_slot_modal_products(modal_html: str, bid: str, slot_id: str) -> List[Tuple[str, bool]]:
     """Extract (product_name, has_enough) tuples from the modal HTML for a given business slot."""
-    modal_pat = (
-        r'id=["\']productSelectModal%s_slot%s["\'].*?(?=<div[^>]*id=["\'](?:productSelectModal|levelUpModal)|\Z)'
-        % (bid, slot_id)
-    )
-    m = re.search(modal_pat, modal_html, re.S)
-    chunk = m.group(0) if m else modal_html
-
     results: List[Tuple[str, bool]] = []
-    for tag_match in re.finditer(r'<[^>]+data-biz-product-select=["\']?1["\']?[^>]*>', chunk):
+    
+    # 1. Match directly by card attributes (data-business-id and data-slot-id)
+    for tag_match in re.finditer(r'<[^>]+data-biz-product-select=["\']?1["\']?[^>]*>', modal_html):
         tag = tag_match.group(0)
+        m_bid = re.search(r'data-business-id=["\'](\d+)["\']', tag)
+        m_slot = re.search(r'data-slot-id=["\'](\d+)["\']', tag)
+        if m_bid and m_slot:
+            if m_bid.group(1) != str(bid) or m_slot.group(1) != str(slot_id):
+                continue
         m_name = re.search(r'data-product-name=["\']([^"\']+)["\']', tag)
         m_enough = re.search(r'data-has-enough=["\']([01])["\']', tag)
         if m_name:
             p_name = m_name.group(1).strip()
             enough = m_enough.group(1) == "1" if m_enough else True
             results.append((p_name, enough))
+    
+    if results:
+        return results
+
+    # 2. Fallback: match by modal id container chunk
+    modal_pat = (
+        r'id=["\']productSelectModal%s_slot%s["\'].*?(?=<div[^>]*id=["\'](?:productSelectModal|levelUpModal)|\Z)'
+        % (bid, slot_id)
+    )
+    m = re.search(modal_pat, modal_html, re.S)
+    if m:
+        for tag_match in re.finditer(r'<[^>]+data-biz-product-select=["\']?1["\']?[^>]*>', m.group(0)):
+            tag = tag_match.group(0)
+            m_name = re.search(r'data-product-name=["\']([^"\']+)["\']', tag)
+            m_enough = re.search(r'data-has-enough=["\']([01])["\']', tag)
+            if m_name:
+                p_name = m_name.group(1).strip()
+                enough = m_enough.group(1) == "1" if m_enough else True
+                results.append((p_name, enough))
+
     return results
 
 
