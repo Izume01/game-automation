@@ -1812,9 +1812,87 @@ def _clean_image(path: str, threshold: float = 175.0) -> Optional[str]:
     return dest
 
 
+def _ocr_operand(c_list: List[np.ndarray]) -> Optional[int]:
+    """Recognize a multi-digit or single-digit operand from isolated glyph components."""
+    if not c_list:
+        return None
+    h_max = max(c.shape[0] for c in c_list)
+    stitched_w = sum(c.shape[1] for c in c_list) + 12 * (len(c_list) - 1) + 40
+    canvas = np.zeros((h_max + 40, stitched_w), dtype=bool)
+    cur_x = 20
+    for c in c_list:
+        ch, cw = c.shape
+        y_off = 20 + (h_max - ch)
+        canvas[y_off:y_off+ch, cur_x:cur_x+cw] = c
+        cur_x += cw + 12
+    out = np.where(canvas, 0, 255).astype(np.uint8).repeat(2, axis=0).repeat(2, axis=1)
+    trans = str.maketrans({
+        "A": "4", "N": "4",
+        "Y": "1", "I": "1", "l": "1",
+        "O": "0", "S": "5", "B": "8", "Z": "2",
+    })
+    wl = "0123456789ANYIlOSBZ"
+    with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as fh:
+        tmp_name = fh.name
+        fh.write(f"P5\n{out.shape[1]} {out.shape[0]}\n255\n".encode())
+        fh.write(out.tobytes())
+    try:
+        for psm in ("8", "7", "6", "10"):
+            r = subprocess.run(
+                ["tesseract", tmp_name, "stdout", "--psm", psm, "-c", f"tessedit_char_whitelist={wl}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            txt = (r.stdout or "").strip().translate(trans)
+            digits = "".join(ch for ch in txt if ch.isdigit())
+            if len(digits) == len(c_list):
+                return int(digits)
+    finally:
+        try:
+            os.remove(tmp_name)
+        except OSError:
+            pass
+
+    # Per-glyph fallback for cases where multi-glyph stitching is ambiguous
+    digits_fallback = []
+    for c in c_list:
+        glyph = np.pad(c, 12, mode="constant", constant_values=False)
+        img = np.where(glyph, 0, 255).astype(np.uint8).repeat(3, axis=0).repeat(3, axis=1)
+        with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as fh:
+            single_name = fh.name
+            fh.write(f"P5\n{img.shape[1]} {img.shape[0]}\n255\n".encode())
+            fh.write(img.tobytes())
+        found_digit = None
+        try:
+            for psm in ("10", "8", "6"):
+                r = subprocess.run(
+                    ["tesseract", single_name, "stdout", "--psm", psm, "-c", f"tessedit_char_whitelist={wl}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                txt = (r.stdout or "").strip().translate(trans)
+                for ch in txt:
+                    if ch.isdigit():
+                        found_digit = ch
+                        break
+                if found_digit:
+                    break
+        finally:
+            try:
+                os.remove(single_name)
+            except OSError:
+                pass
+        if found_digit:
+            digits_fallback.append(found_digit)
+    if len(digits_fallback) == len(c_list):
+        try:
+            return int("".join(digits_fallback))
+        except ValueError:
+            pass
+    return None
+
+
 def _classify_op(c: np.ndarray) -> str:
     ch, cw = c.shape
-    if ch <= 14 and cw >= 8 and ch < cw * 0.65:
+    if ch <= 16 and cw >= 8 and ch < cw * 0.7:
         return "-"
     try:
         import scipy.ndimage
@@ -1891,6 +1969,32 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
                 continue
 
             comps = merged
+
+            # Structured operand parsing: guarantees exact digit counts and prevents hallucinations
+            if len(comps) == 5:
+                n1 = _ocr_operand([c[2] for c in comps[:2]])
+                op = _classify_op(comps[2][2])
+                n2 = _ocr_operand([c[2] for c in comps[3:]])
+                if n1 is not None and n2 is not None:
+                    return n1, n2, f"{n1}{op}{n2}"
+            elif len(comps) == 3:
+                n1 = _ocr_operand([comps[0][2]])
+                op = _classify_op(comps[1][2])
+                n2 = _ocr_operand([comps[2][2]])
+                if n1 is not None and n2 is not None:
+                    return n1, n2, f"{n1}{op}{n2}"
+            elif len(comps) == 4:
+                op_a = _classify_op(comps[1][2])
+                n1_a = _ocr_operand([comps[0][2]])
+                n2_a = _ocr_operand([c[2] for c in comps[2:]])
+                if n1_a is not None and n2_a is not None:
+                    return n1_a, n2_a, f"{n1_a}{op_a}{n2_a}"
+                op_b = _classify_op(comps[2][2])
+                n1_b = _ocr_operand([c[2] for c in comps[:2]])
+                n2_b = _ocr_operand([comps[3][2]])
+                if n1_b is not None and n2_b is not None:
+                    return n1_b, n2_b, f"{n1_b}{op_b}{n2_b}"
+
             h_max = max(comp.shape[0] for _, _, comp in comps)
             stitched_w = sum(comp.shape[1] for _, _, comp in comps) + 12 * (len(comps) - 1) + 40
             canvas = np.zeros((h_max + 40, stitched_w), dtype=bool)
