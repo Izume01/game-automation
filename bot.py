@@ -251,9 +251,16 @@ def login() -> requests.Session:
 def get(sess: requests.Session, path: str, **kw) -> str:
     kw.setdefault("timeout", REQUEST_TIMEOUT)
     kw.setdefault("verify", False)
-    r = sess.get(BASE + path, **kw)
-    r.raise_for_status()
-    return r.text
+    for attempt in range(1, 4):
+        try:
+            r = sess.get(BASE + path, **kw)
+            r.raise_for_status()
+            return r.text
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 3:
+                raise
+            time.sleep(1.5)
+    return ""
 
 
 def post(

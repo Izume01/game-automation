@@ -29,7 +29,9 @@ log = logging.getLogger("fishing")
 
 def parse_fishing_state(html: str) -> Dict[str, Any]:
     """Extract BC_BOOT state and daily quests from balikcilik.php HTML."""
-    m_boot = re.findall(r"(?:window\.)?BC_BOOT\s*=\s*(\{.*?\});", html, re.DOTALL)
+    m_boot = re.findall(
+        r"(?:window\.)?(?:__BOOT_BALIKCILIK\[.*?\]|BC_BOOT)\s*=\s*(\{.*?\});", html, re.DOTALL
+    )
     boot: Dict[str, Any] = {}
     if m_boot:
         try:
