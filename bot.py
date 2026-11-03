@@ -71,7 +71,7 @@ MATH_WITHDRAW = os.environ.get("TICARISK_MATH_WITHDRAW", "1") == "1"
 # Hard floor: the server rejects an answer arriving under ~1.4 s. OCR and both
 # round trips are fitted INSIDE this window, so a question costs ~1.6 s total —
 # the pause between requests (TICARISK_PAUSE) is deliberately not added on top.
-MATH_MIN_MS = int(os.environ.get("TICARISK_MATH_MIN_MS", "2500"))
+MATH_MIN_MS = int(os.environ.get("TICARISK_MATH_MIN_MS", "3000"))
 MATH_OP_TYPE = os.environ.get("TICARISK_MATH_OP_TYPE", "carpma")
 MATH_OPS = {"toplama": "+", "cikarma": "-", "carpma": "*", "bolme": "/"}
 # Slider captcha. 5 rejected verify_human calls lock the account for 600 s, so
@@ -1812,6 +1812,23 @@ def _clean_image(path: str, threshold: float = 175.0) -> Optional[str]:
     return dest
 
 
+def _classify_op(c: np.ndarray) -> str:
+    ch, cw = c.shape
+    if ch <= 14 and cw >= 8 and ch < cw * 0.65:
+        return "-"
+    try:
+        import scipy.ndimage
+        top_slice = c[:max(1, len(c)//4), :].any(axis=0)
+        _, n_top = scipy.ndimage.label(top_slice)
+        bot_slice = c[max(1, 3*len(c)//4):, :].any(axis=0)
+        _, n_bot = scipy.ndimage.label(bot_slice)
+        if n_top >= 2 or n_bot >= 2:
+            return "*"
+    except Exception:
+        pass
+    return "+"
+
+
 def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
     """OCR a question image using connected-component segmentation with dual-pass fallback.
 
@@ -1839,10 +1856,12 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
             raw_comps = []
             for i in range(1, num + 1):
                 comp = (labeled == i)
-                if comp.sum() >= 25:
-                    ys, xs = np.where(comp)
+                ys, xs = np.where(comp)
+                ch = ys.max() - ys.min() + 1
+                cw = xs.max() - xs.min() + 1
+                if comp.sum() >= 30 and ch >= 3 and cw >= 6:
                     if 140 <= xs.mean() <= 460:
-                        raw_comps.append((xs.min(), xs.max(), ys.min(), ys.max(), comp))
+                        raw_comps.append((xs.min(), xs.max(), ys.min(), ys.max(), comp.sum(), comp))
 
             raw_comps.sort(key=lambda x: x[0])
 
@@ -1851,14 +1870,16 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
             for i in range(len(raw_comps)):
                 if i in skip:
                     continue
-                x1_min, x1_max, y1_min, y1_max, c1 = raw_comps[i]
+                x1_min, x1_max, y1_min, y1_max, s1, c1 = raw_comps[i]
                 cur_c = c1.copy()
                 for j in range(i + 1, len(raw_comps)):
                     if j in skip:
                         continue
-                    x2_min, x2_max, y2_min, y2_max, c2 = raw_comps[j]
+                    x2_min, x2_max, y2_min, y2_max, s2, c2 = raw_comps[j]
                     overlap = min(x1_max, x2_max) - max(x1_min, x2_min)
-                    if overlap > 0.4 * min(x1_max - x1_min, x2_max - x2_min):
+                    if overlap > 0.75 * min(x1_max - x1_min, x2_max - x2_min) or (
+                        overlap > 0.3 * min(x1_max - x1_min, x2_max - x2_min) and min(s1, s2) < 70
+                    ):
                         cur_c |= c2
                         x1_min = min(x1_min, x2_min)
                         x1_max = max(x1_max, x2_max)
@@ -1871,14 +1892,14 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
 
             comps = merged
             h_max = max(comp.shape[0] for _, _, comp in comps)
-            stitched_w = sum(comp.shape[1] for _, _, comp in comps) + 16 * (len(comps) - 1) + 32
-            canvas = np.zeros((h_max + 32, stitched_w), dtype=bool)
-            cur_x = 16
+            stitched_w = sum(comp.shape[1] for _, _, comp in comps) + 12 * (len(comps) - 1) + 40
+            canvas = np.zeros((h_max + 40, stitched_w), dtype=bool)
+            cur_x = 20
             for idx, (_, orig_y, comp) in enumerate(comps):
                 ch, cw = comp.shape
-                y_off = 16 + (h_max - ch) // 2 if ch < 22 else 16 + (h_max - ch)
+                y_off = 20 + (h_max - ch) // 2 if ch < 18 else 20 + (h_max - ch)
                 canvas[y_off:y_off+ch, cur_x:cur_x+cw] = comp
-                cur_x += cw + 16
+                cur_x += cw + 12
 
             out = np.where(canvas, 0, 255).astype(np.uint8)
             out = out.repeat(2, axis=0).repeat(2, axis=1)
@@ -1888,21 +1909,35 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
                     fh.write(f"P5\n{out.shape[1]} {out.shape[0]}\n255\n".encode())
                     fh.write(out.tobytes())
                 wl_extended = "0123456789+-*xX/ ANYIlOSBZ "
-                r = subprocess.run(
-                    ["tesseract", dest, "stdout", "--psm", "7", "-c", f"tessedit_char_whitelist={wl_extended}"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                raw_txt = (r.stdout or "").strip()
-                trans = str.maketrans({
-                    "A": "4", "N": "4",
-                    "Y": "1", "I": "1", "l": "1",
-                    "O": "0", "S": "5", "B": "8", "Z": "2",
-                    "x": "*", "X": "*",
-                })
-                expr = raw_txt.translate(trans)
-                pair = _parse_reading(expr)
-                if pair is not None:
-                    return pair[0], pair[1], expr
+                for psm in ("8", "7"):
+                    r = subprocess.run(
+                        ["tesseract", dest, "stdout", "--psm", psm, "-c", f"tessedit_char_whitelist={wl_extended}"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    raw_txt = (r.stdout or "").strip()
+                    trans = str.maketrans({
+                        "A": "4", "N": "4",
+                        "Y": "1", "I": "1", "l": "1",
+                        "O": "0", "S": "5", "B": "8", "Z": "2",
+                        "x": "*", "X": "*",
+                    })
+                    expr = raw_txt.translate(trans)
+                    pair = _parse_reading(expr)
+                    if pair is not None:
+                        if len(comps) == 5:
+                            op = _classify_op(comps[2][2])
+                            return pair[0], pair[1], f"{pair[0]}{op}{pair[1]}"
+                        elif len(comps) == 3:
+                            op = _classify_op(comps[1][2])
+                            return pair[0], pair[1], f"{pair[0]}{op}{pair[1]}"
+                        return pair[0], pair[1], expr
+                    if len(comps) == 5:
+                        digits = re.sub(r"[^0-9]", "", expr)
+                        if len(digits) == 4:
+                            n1 = int(digits[:2])
+                            n2 = int(digits[2:])
+                            op = _classify_op(comps[2][2])
+                            return n1, n2, f"{n1}{op}{n2}"
             finally:
                 try:
                     os.remove(dest)
