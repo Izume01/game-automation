@@ -71,7 +71,7 @@ MATH_WITHDRAW = os.environ.get("TICARISK_MATH_WITHDRAW", "1") == "1"
 # Hard floor: the server rejects an answer arriving under ~1.4 s. OCR and both
 # round trips are fitted INSIDE this window, so a question costs ~1.6 s total —
 # the pause between requests (TICARISK_PAUSE) is deliberately not added on top.
-MATH_MIN_MS = int(os.environ.get("TICARISK_MATH_MIN_MS", "1500"))
+MATH_MIN_MS = int(os.environ.get("TICARISK_MATH_MIN_MS", "2500"))
 MATH_OP_TYPE = os.environ.get("TICARISK_MATH_OP_TYPE", "carpma")
 MATH_OPS = {"toplama": "+", "cikarma": "-", "carpma": "*", "bolme": "/"}
 # Slider captcha. 5 rejected verify_human calls lock the account for 600 s, so
@@ -1601,6 +1601,9 @@ def solve_puzzle(sess, path: str, cyc: Cycle) -> Tuple[bool, int]:
     challenge — that stacking is what produced the 600 s lock. Give up before
     the budget is gone rather than after.
     """
+    if DRY_RUN:
+        cyc.add("captcha", "solve", True, "dry-run — puzzle skipped")
+        return True, 0
     if np is None:
         cyc.add("captcha", "solve", False, "numpy not installed", soft=True)
         return False, 0
@@ -1766,8 +1769,8 @@ def _parse_reading(text: str) -> Optional[Tuple[int, int]]:
     return None
 
 
-def _clean_image(path: str) -> Optional[str]:
-    """Clean image at native resolution, removing isolated noise stars via connected components."""
+def _clean_image(path: str, threshold: float = 175.0) -> Optional[str]:
+    """Clean image at native resolution, removing background gradient and noise scratch lines."""
     try:
         with open(path, "rb") as fh:
             data = fh.read()
@@ -1775,32 +1778,24 @@ def _clean_image(path: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         return None
 
-    vals = arr.mean(2)
-    fg = vals > 35
-    visited = np.zeros(fg.shape, dtype=bool)
-    clean_fg = np.zeros(fg.shape, dtype=bool)
-    h, w = fg.shape
+    vals = arr.mean(2) if arr.ndim == 3 else arr
+    fg = vals > threshold
 
-    for y in range(h):
-        for x in range(w):
-            if fg[y, x] and not visited[y, x]:
-                q = [(y, x)]
-                visited[y, x] = True
-                comp = [(y, x)]
-                for cy, cx in q:
-                    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
-                        ny, nx = cy + dy, cx + dx
-                        if 0 <= ny < h and 0 <= nx < w and fg[ny, nx] and not visited[ny, nx]:
-                            visited[ny, nx] = True
-                            q.append((ny, nx))
-                            comp.append((ny, nx))
-                if len(comp) >= 10:
-                    for cy, cx in comp:
-                        clean_fg[cy, cx] = True
+    try:
+        import scipy.ndimage
+        opened = scipy.ndimage.binary_opening(fg, structure=np.ones((2, 2)))
+    except Exception:
+        eroded = fg[:-1, :-1] & fg[1:, :-1] & fg[:-1, 1:] & fg[1:, 1:]
+        opened = np.zeros_like(fg)
+        opened[:-1, :-1] |= eroded
+        opened[1:, :-1] |= eroded
+        opened[:-1, 1:] |= eroded
+        opened[1:, 1:] |= eroded
 
-    out = np.where(clean_fg, 0, 255).astype(np.uint8)
+    out = np.where(opened, 0, 255).astype(np.uint8)
+    out = out.repeat(2, axis=0).repeat(2, axis=1)
     out = np.pad(out, 16, mode="constant", constant_values=255)
-    dest = path + ".clean.pgm"
+    dest = f"{path}.clean_{int(threshold)}.pgm"
     try:
         with open(dest, "wb") as fh:
             fh.write(f"P5\n{out.shape[1]} {out.shape[0]}\n255\n".encode())
@@ -1811,11 +1806,105 @@ def _clean_image(path: str) -> Optional[str]:
 
 
 def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
-    """OCR a question image using dual passes on both cleaned and raw image.
+    """OCR a question image using connected-component segmentation with dual-pass fallback.
 
     Returns (a, b, text).
     """
-    wl = "0123456789+-*x "
+    wl = "0123456789+-*xX/ "
+
+    # 1. Component segmentation pass: isolates each digit/operator glyph,
+    # eliminating background gradient, faint decoys, and scratch lines.
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        arr, _w, _h = _im_load(data)
+        vals = arr.mean(2) if arr.ndim == 3 else arr
+        for th in (180, 185, 175):
+            fg = vals > th
+            try:
+                import scipy.ndimage
+                labeled, num = scipy.ndimage.label(fg)
+            except Exception:
+                labeled, num = None, 0
+            if labeled is None or num == 0:
+                continue
+
+            raw_comps = []
+            for i in range(1, num + 1):
+                comp = (labeled == i)
+                if comp.sum() >= 25:
+                    ys, xs = np.where(comp)
+                    if 140 <= xs.mean() <= 460:
+                        raw_comps.append((xs.min(), xs.max(), ys.min(), ys.max(), comp))
+
+            raw_comps.sort(key=lambda x: x[0])
+
+            merged = []
+            skip = set()
+            for i in range(len(raw_comps)):
+                if i in skip:
+                    continue
+                x1_min, x1_max, y1_min, y1_max, c1 = raw_comps[i]
+                cur_c = c1.copy()
+                for j in range(i + 1, len(raw_comps)):
+                    if j in skip:
+                        continue
+                    x2_min, x2_max, y2_min, y2_max, c2 = raw_comps[j]
+                    overlap = min(x1_max, x2_max) - max(x1_min, x2_min)
+                    if overlap > 0.4 * min(x1_max - x1_min, x2_max - x2_min):
+                        cur_c |= c2
+                        x1_min = min(x1_min, x2_min)
+                        x1_max = max(x1_max, x2_max)
+                        skip.add(j)
+                ys, xs = np.where(cur_c)
+                merged.append((xs.min(), ys.min(), cur_c[ys.min():ys.max()+1, xs.min():xs.max()+1]))
+
+            if len(merged) not in (3, 4, 5):
+                continue
+
+            comps = merged
+            h_max = max(comp.shape[0] for _, _, comp in comps)
+            stitched_w = sum(comp.shape[1] for _, _, comp in comps) + 16 * (len(comps) - 1) + 32
+            canvas = np.zeros((h_max + 32, stitched_w), dtype=bool)
+            cur_x = 16
+            for idx, (_, orig_y, comp) in enumerate(comps):
+                ch, cw = comp.shape
+                y_off = 16 + (h_max - ch) // 2 if ch < 22 else 16 + (h_max - ch)
+                canvas[y_off:y_off+ch, cur_x:cur_x+cw] = comp
+                cur_x += cw + 16
+
+            out = np.where(canvas, 0, 255).astype(np.uint8)
+            out = out.repeat(2, axis=0).repeat(2, axis=1)
+            dest = f"{path}.clean_stitched.pgm"
+            try:
+                with open(dest, "wb") as fh:
+                    fh.write(f"P5\n{out.shape[1]} {out.shape[0]}\n255\n".encode())
+                    fh.write(out.tobytes())
+                wl_extended = "0123456789+-*xX/ ANYIlOSBZ "
+                r = subprocess.run(
+                    ["tesseract", dest, "stdout", "--psm", "7", "-c", f"tessedit_char_whitelist={wl_extended}"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                raw_txt = (r.stdout or "").strip()
+                trans = str.maketrans({
+                    "A": "4", "N": "4",
+                    "Y": "1", "I": "1", "l": "1",
+                    "O": "0", "S": "5", "B": "8", "Z": "2",
+                    "x": "*", "X": "*",
+                })
+                expr = raw_txt.translate(trans)
+                pair = _parse_reading(expr)
+                if pair is not None:
+                    return pair[0], pair[1], expr
+            finally:
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2. Dual-pass scan on whole cleaned and raw image as fallback
     votes: Dict[Tuple[int, int], int] = {}
     sample_texts: Dict[Tuple[int, int], str] = {}
 
@@ -1834,15 +1923,19 @@ def _read_question(path: str) -> Optional[Tuple[int, int, str]]:
                 if pair not in sample_texts:
                     sample_texts[pair] = t
 
-    clean = _clean_image(path)
-    if clean:
-        scan(clean, weight=2)
-        try:
-            os.remove(clean)
-        except OSError:
-            pass
+    for th in (175, 170, 180):
+        clean = _clean_image(path, threshold=th)
+        if clean:
+            scan(clean, weight=2)
+            try:
+                os.remove(clean)
+            except OSError:
+                pass
+        if votes:
+            break
 
-    scan(path, weight=1)
+    if not votes:
+        scan(path, weight=1)
 
     if not votes:
         fallback_txt = _ocr_png(path)
@@ -1859,14 +1952,22 @@ def _pick_math_op(text: str, tipi: str) -> str:
     """The server's islem_tipi wins; OCR symbols are only a fallback."""
     if tipi in MATH_OPS:
         return MATH_OPS[tipi]
-    if "+" in text:
-        return "+"
-    if "-" in text:
-        return "-"
+    m = re.search(r"\d\s*([+\-*/xX])\s*-?\d", text)
+    if m:
+        sym = m.group(1)
+        if sym in ("*", "x", "X"):
+            return "*"
+        if sym == "/":
+            return "/"
+        return sym
     if "*" in text or "x" in text or "X" in text:
         return "*"
     if "/" in text:
         return "/"
+    if "-" in text:
+        return "-"
+    if "+" in text:
+        return "+"
     return "+"
 
 
@@ -1907,14 +2008,16 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
     consecutive_unreadable = 0
     workdir = tempfile.mkdtemp(prefix="ticarisk_math_")
     qpath = os.path.join(workdir, "q.png")
+    q: Optional[Dict] = None
     try:
         for n in range(1, MATH_MAX + 1):
-            q = post(
-                sess,
-                "/matematik.php",
-                {"ajax_request": 1, "action": "get_question", "islem_tipi": MATH_OP_TYPE},
-                pause=False,
-            )
+            if q is None:
+                q = post(
+                    sess,
+                    "/matematik.php",
+                    {"ajax_request": 1, "action": "get_question", "islem_tipi": MATH_OP_TYPE},
+                    pause=False,
+                )
             # The anti-bot timer starts when the server issues the question, so
             # measure from here — not from before get_question — or the answer
             # lands early and trips verification_required.
@@ -1946,6 +2049,7 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
                 if consecutive_unreadable >= 3:
                     reason = f"could not read question: {_ocr_png(qpath)!r}"
                     break
+                q = None
                 time.sleep(1.0)
                 continue
             consecutive_unreadable = 0
@@ -1990,6 +2094,7 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
                 if not solved:
                     reason = "verification required and the slider was not solved"
                     break
+                q = None
                 continue
             if "dogru" not in a:
                 # refusal with no verdict — "Hourly round limit reached!", a
@@ -2022,6 +2127,11 @@ def section_math(sess, cyc: Cycle, inspect: bool) -> None:
                 kasa = str(a["matematik_kasa"])
             if kalan is not None and kalan <= 0:
                 break
+            nxt = a.get("next_question")
+            if isinstance(nxt, dict) and nxt.get("success") and nxt.get("question_image_url"):
+                q = nxt
+            else:
+                q = None
             if n % 25 == 0:
                 log.info("math: %d solved, %s left, vault $%s", right, kalan, kasa)
     except Exception as exc:  # noqa: BLE001 - reported as a step, never fatal
